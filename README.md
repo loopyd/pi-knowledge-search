@@ -34,7 +34,7 @@ This walks you through:
 1. **Directories** to index (comma-separated paths)
 2. **File extensions** to include (default: `.md, .txt`)
 3. **Directories to exclude** (default: `node_modules, .git, .obsidian, .trash`)
-4. **Embedding provider** — OpenAI, OpenAI-compatible (local/self-hosted), AWS Bedrock, or Ollama
+4. **Embedding provider** — OpenAI, AWS Bedrock, or local Ollama
 
 Config is saved to `~/.pi/knowledge-search.json`. Run `/reload` to activate.
 
@@ -47,6 +47,9 @@ You can also edit the config file directly:
   "dirs": ["~/notes", "~/docs"],
   "fileExtensions": [".md", ".txt"],
   "excludeDirs": ["node_modules", ".git", ".obsidian", ".trash"],
+  "logFile": "~/.pi/knowledge-search/logs/knowledge-search.log",
+  "verboseLogging": true,
+  "quarantineEnabled": true,
   "provider": {
     "type": "openai",
     "model": "text-embedding-3-small"
@@ -55,6 +58,8 @@ You can also edit the config file directly:
 ```
 
 The API key for OpenAI can be set in the config file (`"apiKey": "sk-..."`) or via the `OPENAI_API_KEY` environment variable.
+
+When `quarantineEnabled` is true, malformed chunks (for example, unpaired surrogate code points that can break JSON parsing) are stored directly in `index.json` with a quarantine flag and skipped by search/scoring.
 
 <details>
 <summary>Bedrock config</summary>
@@ -94,37 +99,6 @@ Requires [Ollama](https://ollama.ai) running locally:
 ollama serve
 ollama pull nomic-embed-text
 ```
-
-</details>
-
-<details>
-<summary>OpenAI-compatible config (free, local/self-hosted)</summary>
-
-Any server that exposes an OpenAI-compatible `/v1/embeddings` endpoint works:
-[llama.cpp](https://github.com/ggml-org/llama.cpp), [vLLM](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html),
-[litellm](https://docs.litellm.ai/), [Ollama's OpenAI-compatibility mode](https://ollama.com/blog/openai-compatibility), etc.
-
-```json
-{
-  "dirs": ["~/notes"],
-  "provider": {
-    "type": "openai-compatible",
-    "baseUrl": "http://127.0.0.1:8080",
-    "apiKey": "your-local-key",
-    "model": "qwen3-embeddings"
-  }
-}
-```
-
-The `baseUrl` should be your server root **without** a trailing `/v1` path — the embedder appends `/v1/embeddings` automatically.
-
-For example with llama-cpp-python:
-```bash
-python -m llama_cpp.server --model ./models/qwen3-embedding.gguf --port 8080
-```
-Then configure knowledge-search to point at `http://127.0.0.1:8080` as shown above.
-
-The `apiKey` field is optional; omit it if your runner doesn't require authentication.
 
 </details>
 

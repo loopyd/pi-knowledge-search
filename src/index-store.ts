@@ -3,6 +3,12 @@ import * as path from "node:path";
 import type { Config } from "./config";
 import type { Embedder } from "./embedder";
 import { chunkMarkdown, type Chunk } from "./chunker";
+import {
+  countUnpairedSurrogates,
+  logDebug,
+  logInfo,
+  logWarn,
+} from "./logging";
 
 interface IndexEntry {
   /** Relative path from its source directory root */
@@ -19,6 +25,12 @@ interface IndexEntry {
   heading: string;
   /** Chunk index (0, 1, 2... for multi-chunk files) */
   chunkIndex: number;
+  /** If true, this chunk was intentionally skipped (e.g. malformed text) */
+  quarantined?: boolean;
+  /** Optional reason for quarantine */
+  quarantineReason?: string;
+  /** Optional diagnostics for quarantine */
+  quarantineDetails?: Record<string, unknown>;
 }
 
 interface IndexData {
@@ -38,7 +50,7 @@ export interface SearchResult {
   heading: string;
 }
 
-const INDEX_VERSION = 3; // Bumped from 2 for chunk support
+const INDEX_VERSION = 4; // Bumped for in-index quarantine metadata
 const MAX_EXCERPT_LENGTH = 3500; // Safety cap for stored excerpts
 
 export class KnowledgeIndex {
@@ -125,6 +137,18 @@ export class KnowledgeIndex {
     return hashIdx >= 0 ? key.slice(0, hashIdx) : key;
   }
 
+  private indexedMtimeForFile(absPath: string): number | null {
+    const prefix = `${absPath}#`;
+    let best: number | null = null;
+    for (const [key, entry] of Object.entries(this.data.entries)) {
+      if (!key.startsWith(prefix)) continue;
+      if (best == null || entry.mtime > best) {
+        best = entry.mtime;
+      }
+    }
+    return best;
+  }
+
   /**
    * Remove all chunks for a given absolute file path.
    */
@@ -155,7 +179,13 @@ export class KnowledgeIndex {
    * Scan all configured directories, find new/changed/removed files, update index.
    */
   async sync(): Promise<{ added: number; updated: number; removed: number }> {
+    const startedAt = Date.now();
     const allFiles = this.scanAllFiles();
+    logInfo("index-store", "sync start", {
+      scannedFileCount: allFiles.length,
+      indexSize: this.size(),
+      chunkCount: this.chunkCount(),
+    });
     const currentPaths = new Set(allFiles.map((f) => f.absPath));
 
     // Remove entries for files that no longer exist
@@ -167,6 +197,7 @@ export class KnowledgeIndex {
         seenRemoved.add(absPath);
         removed += 1;
         this.removeAllChunks(absPath);
+        this.save();
       }
     }
 
@@ -181,10 +212,8 @@ export class KnowledgeIndex {
     }[] = [];
 
     for (const file of allFiles) {
-      // Check if any chunk exists for this file with current mtime
-      const existingKey = this.entryKey(file.absPath, 0);
-      const existing = this.data.entries[existingKey];
-      if (existing && existing.mtime >= file.mtime) continue;
+      const indexedMtime = this.indexedMtimeForFile(file.absPath);
+      if (indexedMtime != null && indexedMtime >= file.mtime) continue;
 
       const content = this.readFileContent(file.absPath);
       if (!content || content.trim().length <= 20) continue;
@@ -199,24 +228,73 @@ export class KnowledgeIndex {
     let updated = 0;
 
     if (toProcess.length > 0) {
+      logInfo("index-store", "sync processing changed files", {
+        fileCount: toProcess.length,
+      });
+
+      const processedFiles = new Set<number>();
+      const ensureFilePrepared = (fileIdx: number): void => {
+        if (processedFiles.has(fileIdx)) return;
+        processedFiles.add(fileIdx);
+        const file = toProcess[fileIdx];
+        const hadExisting = this.removeAllChunks(file.absPath) > 0;
+        if (hadExisting) updated++;
+        else added++;
+      };
+
       // Flatten all chunks for batch embedding
       const allChunkTexts: string[] = [];
       const chunkMeta: { fileIdx: number; chunkIdx: number }[] = [];
+      let quarantinedCount = 0;
 
       for (let fi = 0; fi < toProcess.length; fi++) {
         const file = toProcess[fi];
         for (let ci = 0; ci < file.chunks.length; ci++) {
           const chunk = file.chunks[ci];
-          allChunkTexts.push(
-            this.chunkEmbedText(file.relPath, chunk.heading, chunk.text)
-          );
+          const embedText = this.chunkEmbedText(file.relPath, chunk.heading, chunk.text);
+          const unpairedSurrogates = countUnpairedSurrogates(embedText);
+
+          if (this.config.quarantineEnabled && unpairedSurrogates > 0) {
+            ensureFilePrepared(fi);
+            const key = this.entryKey(file.absPath, ci);
+            this.data.entries[key] = {
+              relPath: file.relPath,
+              sourceDir: file.sourceDir,
+              mtime: file.mtime,
+              vector: [],
+              excerpt: chunk.text.slice(0, MAX_EXCERPT_LENGTH),
+              heading: chunk.heading,
+              chunkIndex: ci,
+              quarantined: true,
+              quarantineReason: "unpaired-surrogate",
+              quarantineDetails: {
+                unpairedSurrogates,
+                chunkChars: chunk.text.length,
+              },
+            };
+            quarantinedCount++;
+            this.save();
+            continue;
+          }
+
+          allChunkTexts.push(embedText);
           chunkMeta.push({ fileIdx: fi, chunkIdx: ci });
         }
+      }
+
+      if (quarantinedCount > 0) {
+        logWarn("index-store", "chunks quarantined before embedding", {
+          count: quarantinedCount,
+        });
       }
 
       // Embed in batches
       const BATCH_SIZE = 50;
       const allVectors: (number[] | null)[] = new Array(allChunkTexts.length).fill(null);
+      logDebug("index-store", "embedding batch plan", {
+        totalChunks: allChunkTexts.length,
+        batchSize: BATCH_SIZE,
+      });
 
       for (let i = 0; i < allChunkTexts.length; i += BATCH_SIZE) {
         const batchTexts = allChunkTexts.slice(i, i + BATCH_SIZE);
@@ -226,9 +304,33 @@ export class KnowledgeIndex {
         }
       }
 
-      // Store results, grouped by file
-      const processedFiles = new Set<number>();
+      const failedVectorMeta: {
+        relPath: string;
+        sourceDir: string;
+        chunkIndex: number;
+        chunkChars: number;
+      }[] = [];
+      for (let i = 0; i < allVectors.length; i++) {
+        if (allVectors[i]) continue;
+        const { fileIdx, chunkIdx } = chunkMeta[i];
+        const file = toProcess[fileIdx];
+        const chunk = file.chunks[chunkIdx];
+        failedVectorMeta.push({
+          relPath: file.relPath,
+          sourceDir: file.sourceDir,
+          chunkIndex: chunkIdx,
+          chunkChars: chunk.text.length,
+        });
+      }
+      if (failedVectorMeta.length > 0) {
+        logWarn("index-store", "chunk embeddings failed", {
+          failedCount: failedVectorMeta.length,
+          totalChunks: allChunkTexts.length,
+          sample: failedVectorMeta.slice(0, 20),
+        });
+      }
 
+      // Store results incrementally and persist each successful upsert
       for (let i = 0; i < chunkMeta.length; i++) {
         const { fileIdx, chunkIdx } = chunkMeta[i];
         const vector = allVectors[i];
@@ -236,13 +338,7 @@ export class KnowledgeIndex {
 
         const file = toProcess[fileIdx];
 
-        // On first chunk of a file, remove old chunks and track add/update
-        if (!processedFiles.has(fileIdx)) {
-          processedFiles.add(fileIdx);
-          const hadExisting = this.removeAllChunks(file.absPath) > 0;
-          if (hadExisting) updated++;
-          else added++;
-        }
+        ensureFilePrepared(fileIdx);
 
         const chunk = file.chunks[chunkIdx];
         const key = this.entryKey(file.absPath, chunkIdx);
@@ -254,13 +350,24 @@ export class KnowledgeIndex {
           excerpt: chunk.text.slice(0, MAX_EXCERPT_LENGTH),
           heading: chunk.heading,
           chunkIndex: chunkIdx,
+          quarantined: false,
         };
+        this.save();
       }
     }
 
     if (added + updated + removed > 0) {
       this.save();
     }
+
+    logInfo("index-store", "sync complete", {
+      added,
+      updated,
+      removed,
+      finalIndexSize: this.size(),
+      finalChunkCount: this.chunkCount(),
+      durationMs: Date.now() - startedAt,
+    });
 
     return { added, updated, removed };
   }
@@ -279,7 +386,7 @@ export class KnowledgeIndex {
 
     const scored: { key: string; absPath: string; score: number }[] = [];
     for (const [key, entry] of Object.entries(this.data.entries)) {
-      if (!entry.vector) continue;
+      if (!entry.vector || entry.vector.length === 0 || entry.quarantined) continue;
       const score = dotProduct(queryVector, entry.vector);
       scored.push({ key, absPath: this.absPathFromKey(key), score });
     }
@@ -338,34 +445,67 @@ export class KnowledgeIndex {
     // Remove old chunks for this file
     this.removeAllChunks(absPath);
 
-    // Embed and store each chunk
-    const texts = chunks.map((c) =>
-      this.chunkEmbedText(relPath, c.heading, c.text)
-    );
-    const vectors = await this.embedder.embedBatch(texts);
+    // Prepare chunk payloads and mark malformed chunks as quarantined in-index.
+    const texts: string[] = [];
+    const map: number[] = [];
 
     for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const text = this.chunkEmbedText(relPath, chunk.heading, chunk.text);
+      const unpairedSurrogates = countUnpairedSurrogates(text);
+
+      if (this.config.quarantineEnabled && unpairedSurrogates > 0) {
+        const key = this.entryKey(absPath, i);
+        this.data.entries[key] = {
+          relPath,
+          sourceDir,
+          mtime: stat.mtimeMs,
+          vector: [],
+          excerpt: chunk.text.slice(0, MAX_EXCERPT_LENGTH),
+          heading: chunk.heading,
+          chunkIndex: i,
+          quarantined: true,
+          quarantineReason: "unpaired-surrogate",
+          quarantineDetails: {
+            unpairedSurrogates,
+            chunkChars: chunk.text.length,
+          },
+        };
+        this.save();
+        continue;
+      }
+
+      texts.push(text);
+      map.push(i);
+    }
+
+    const vectors = texts.length > 0 ? await this.embedder.embedBatch(texts) : [];
+
+    for (let i = 0; i < vectors.length; i++) {
       const vector = vectors[i];
       if (!vector) continue;
 
-      const key = this.entryKey(absPath, i);
+      const chunkIndex = map[i];
+
+      const key = this.entryKey(absPath, chunkIndex);
       this.data.entries[key] = {
         relPath,
         sourceDir,
         mtime: stat.mtimeMs,
         vector,
-        excerpt: chunks[i].text.slice(0, MAX_EXCERPT_LENGTH),
-        heading: chunks[i].heading,
-        chunkIndex: i,
+        excerpt: chunks[chunkIndex].text.slice(0, MAX_EXCERPT_LENGTH),
+        heading: chunks[chunkIndex].heading,
+        chunkIndex,
+        quarantined: false,
       };
+      this.save();
     }
-    this.scheduleSave();
   }
 
   removeFile(absPath: string): void {
     const removed = this.removeAllChunks(absPath);
     if (removed > 0) {
-      this.scheduleSave();
+      this.save();
     }
   }
 

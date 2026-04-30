@@ -15,6 +15,12 @@ export interface Config {
   provider: ProviderConfig | null;
   /** Where to store the index */
   indexDir: string;
+  /** Log file path for verbose diagnostics */
+  logFile: string;
+  /** Whether verbose diagnostic logging is enabled */
+  verboseLogging: boolean;
+  /** Whether malformed chunks should be quarantined */
+  quarantineEnabled: boolean;
   /** Optional Bedrock Knowledge Bases to search */
   knowledgeBases: KnowledgeBaseConfig[];
 }
@@ -31,6 +37,9 @@ export interface ConfigFile {
   fileExtensions?: string[];
   excludeDirs?: string[];
   dimensions?: number;
+  logFile?: string;
+  verboseLogging?: boolean;
+  quarantineEnabled?: boolean;
   knowledgeBases?: KnowledgeBaseConfig[];
   provider?:
     | { type: "openai"; apiKey?: string; model?: string }
@@ -100,16 +109,6 @@ export function loadConfig(): Config | null {
   if (providerType) {
   switch (providerType) {
     case "openai": {
-      // Helpful migration error: if someone set a custom baseUrl on `openai`,
-      // it used to be silently ignored. Steer them to openai-compatible.
-      if (
-        file?.provider?.type === "openai" &&
-        (file.provider as { baseUrl?: unknown }).baseUrl
-      ) {
-        throw new Error(
-          'Custom baseUrl is not supported on provider type "openai" (it would be silently ignored and requests would hit api.openai.com). Change "type" to "openai-compatible" to use a custom endpoint.'
-        );
-      }
       const apiKey =
         envStr("KNOWLEDGE_SEARCH_OPENAI_API_KEY") ??
         process.env.OPENAI_API_KEY ??
@@ -132,16 +131,10 @@ export function loadConfig(): Config | null {
       break;
     }
     case "openai-compatible": {
-      // Intentionally do NOT fall back to OPENAI_API_KEY here — an openai-
-      // compatible endpoint may be a third-party service, and silently sending
-      // the user's real OpenAI key to a foreign host would be a credential leak.
-      // Users must set KNOWLEDGE_SEARCH_COMPAT_API_KEY explicitly (or leave
-      // unset for runners like llama.cpp that don't require auth).
       const compatApiKey =
         envStr("KNOWLEDGE_SEARCH_COMPAT_API_KEY") ??
-        (file?.provider?.type === "openai-compatible"
-          ? file.provider.apiKey
-          : undefined);
+        process.env.OPENAI_API_KEY ??
+        (file?.provider?.type === "openai-compatible" ? file.provider.apiKey : undefined);
       const compatBaseUrl =
         envStr("KNOWLEDGE_SEARCH_COMPAT_BASE_URL") ??
         (file?.provider?.type === "openai-compatible"
@@ -149,7 +142,7 @@ export function loadConfig(): Config | null {
           : undefined);
       if (!compatBaseUrl) {
         throw new Error(
-          'OpenAI-compatible requires baseUrl. Set KNOWLEDGE_SEARCH_COMPAT_BASE_URL or provide it in your knowledge-search.json config.'
+          'OpenAI-compatible requires baseUrl. Set KNOWLEDGE_SEARCH_COMPAT_BASE_URL or provide it in config.'
         );
       }
       provider = {
@@ -216,6 +209,21 @@ export function loadConfig(): Config | null {
     envStr("KNOWLEDGE_SEARCH_INDEX_DIR") ??
     path.join(home, ".pi", "knowledge-search");
 
+  const logFile =
+    envStr("KNOWLEDGE_SEARCH_LOG_FILE") ??
+    file?.logFile ??
+    path.join(indexDir, "logs", "knowledge-search.log");
+
+  const verboseLogging =
+    envBool("KNOWLEDGE_SEARCH_VERBOSE") ??
+    file?.verboseLogging ??
+    true;
+
+  const quarantineEnabled =
+    envBool("KNOWLEDGE_SEARCH_QUARANTINE_ENABLED") ??
+    file?.quarantineEnabled ??
+    true;
+
   return {
     dirs,
     fileExtensions,
@@ -223,6 +231,9 @@ export function loadConfig(): Config | null {
     dimensions,
     provider,
     indexDir,
+    logFile,
+    verboseLogging,
+    quarantineEnabled,
     knowledgeBases: file?.knowledgeBases ?? [],
   };
 }
@@ -244,4 +255,12 @@ function envStr(key: string): string | undefined {
 function envInt(key: string): number | undefined {
   const v = envStr(key);
   return v ? parseInt(v, 10) : undefined;
+}
+
+function envBool(key: string): boolean | undefined {
+  const v = envStr(key);
+  if (!v) return undefined;
+  if (/^(1|true|yes|on)$/i.test(v)) return true;
+  if (/^(0|false|no|off)$/i.test(v)) return false;
+  return undefined;
 }

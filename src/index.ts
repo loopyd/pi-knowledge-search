@@ -12,6 +12,14 @@ import {
 import { createEmbedder } from "./embedder";
 import { KnowledgeIndex } from "./index-store";
 import { BedrockKBSearcher } from "./kb-searcher";
+import {
+  getKnowledgeSearchLogPath,
+  isKnowledgeSearchVerbose,
+  logDebug,
+  logError,
+  logInfo,
+  logWarn,
+} from "./logging";
 
 export default function (pi: ExtensionAPI) {
   let index: KnowledgeIndex | null = null;
@@ -28,9 +36,30 @@ export default function (pi: ExtensionAPI) {
     try {
       currentConfig = loadConfig();
     } catch {
+      logError("index", "Failed to load config during session start");
       return;
     }
     if (!currentConfig) return;
+
+    process.env.KNOWLEDGE_SEARCH_LOG_FILE = currentConfig.logFile;
+    process.env.KNOWLEDGE_SEARCH_VERBOSE = currentConfig.verboseLogging ? "1" : "0";
+    process.env.KNOWLEDGE_SEARCH_QUARANTINE_ENABLED = currentConfig.quarantineEnabled ? "1" : "0";
+
+    logInfo("index", "session_start", {
+      hasProvider: Boolean(currentConfig.provider),
+      providerType: currentConfig.provider?.type,
+      dimensions: currentConfig.dimensions,
+      dirCount: currentConfig.dirs.length,
+      kbCount: currentConfig.knowledgeBases.length,
+      quarantineEnabled: currentConfig.quarantineEnabled,
+      verbose: isKnowledgeSearchVerbose(),
+      logPath: getKnowledgeSearchLogPath(),
+    });
+
+    if (isKnowledgeSearchVerbose()) {
+      ctx.ui.setStatus("knowledge-search", `Verbose logs: ${getKnowledgeSearchLogPath()}`);
+      setTimeout(() => ctx.ui.setStatus("knowledge-search", ""), 7000);
+    }
 
     if (currentConfig.provider) {
       const embedder = createEmbedder(currentConfig.provider, currentConfig.dimensions);
@@ -62,25 +91,55 @@ export default function (pi: ExtensionAPI) {
         [],
         {
           stdio: ["ignore", "pipe", "pipe", "ipc"],
-          env: { ...process.env },
+          env: {
+            ...process.env,
+            KNOWLEDGE_SEARCH_VERBOSE: process.env.KNOWLEDGE_SEARCH_VERBOSE,
+            KNOWLEDGE_SEARCH_LOG_FILE: process.env.KNOWLEDGE_SEARCH_LOG_FILE,
+            KNOWLEDGE_SEARCH_QUARANTINE_ENABLED: process.env.KNOWLEDGE_SEARCH_QUARANTINE_ENABLED,
+          },
         }
       );
 
+      logInfo("index", "spawned sync worker", {
+        workerPath,
+        pid: worker.pid,
+      });
+
       let stdout = "";
-      worker.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      worker.stdout?.on("data", (chunk: Buffer) => {
+        const text = chunk.toString();
+        stdout += text;
+        logDebug("index", "worker stdout chunk", {
+          chunkLength: text.length,
+          totalStdoutLength: stdout.length,
+        });
+      });
       worker.stderr?.on("data", (chunk: Buffer) => {
-        console.error(`knowledge-search worker: ${chunk.toString().trim()}`);
+        const text = chunk.toString().trim();
+        console.error(`knowledge-search worker: ${text}`);
+        logWarn("index", "worker stderr", { message: text });
       });
 
       worker.on("error", (err) => {
         console.error(`knowledge-search: worker error: ${err.message}`);
+        logError("index", "worker error", {
+          message: err.message,
+          stack: err.stack,
+        });
       });
 
       worker.on("exit", (code, signal) => {
         syncDone = true;
+        logInfo("index", "worker exit", {
+          code,
+          signal,
+          stdoutLength: stdout.length,
+          expectedExit: workerExitExpected,
+        });
         if (code === 0 && stdout) {
           try {
             const result = JSON.parse(stdout);
+            logInfo("index", "worker result parsed", result);
             // Reload the index from disk since the worker updated it
             index!.loadSync();
             const changes = result.added + result.updated + result.removed;
@@ -91,8 +150,11 @@ export default function (pi: ExtensionAPI) {
               );
               setTimeout(() => ctx.ui.setStatus("knowledge-search", ""), 5000);
             }
-          } catch {
-            // ignore parse errors
+          } catch (err: any) {
+            logError("index", "worker stdout parse failed", {
+              message: err?.message,
+              stdoutPreview: stdout.slice(0, 500),
+            });
           }
         } else if (code !== 0 && !workerExitExpected) {
           const now = Date.now();
@@ -100,6 +162,9 @@ export default function (pi: ExtensionAPI) {
           if (now - workerRestartWindowStart > RESTART_WINDOW_MS) {
             workerRestartCount = 0;
             workerRestartWindowStart = now;
+            logInfo("index", "worker restart counter reset", {
+              restartWindowMs: RESTART_WINDOW_MS,
+            });
           }
           workerRestartCount++;
 
@@ -107,10 +172,20 @@ export default function (pi: ExtensionAPI) {
             console.error(
               `knowledge-search: worker crashed ${workerRestartCount} times within ${RESTART_WINDOW_MS / 1000}s, giving up`
             );
+            logError("index", "worker restart limit exceeded", {
+              workerRestartCount,
+              restartWindowMs: RESTART_WINDOW_MS,
+            });
           } else {
             console.error(
               `knowledge-search: worker exited unexpectedly (code=${code}, signal=${signal}), restarting (${workerRestartCount}/${MAX_WORKER_RESTARTS})...`
             );
+            logWarn("index", "worker restarting", {
+              code,
+              signal,
+              workerRestartCount,
+              maxRestarts: MAX_WORKER_RESTARTS,
+            });
             setTimeout(() => {
               if (!workerExitExpected) spawnWorker();
             }, 2000);
@@ -125,6 +200,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     workerExitExpected = true;
+    logInfo("index", "session_shutdown");
     // watcher removed (d38a81f) — caused UI freezes. Rely on sync-on-startup only.
     index?.close();
   });
@@ -178,7 +254,31 @@ export default function (pi: ExtensionAPI) {
         .map((d: string) => d.trim())
         .filter(Boolean);
 
-      // Step 4: Provider
+      // Step 4: Logging and quarantine
+      const logFile = await ctx.ui.input(
+        "Log file path:",
+        "~/.pi/knowledge-search/logs/knowledge-search.log"
+      );
+
+      const verboseChoice = await ctx.ui.select("Verbose logging:", [
+        "yes",
+        "no",
+      ]);
+      if (!verboseChoice) {
+        ctx.ui.notify("Setup cancelled.", "info");
+        return;
+      }
+
+      const quarantineChoice = await ctx.ui.select(
+        "Quarantine malformed chunks:",
+        ["yes", "no"]
+      );
+      if (!quarantineChoice) {
+        ctx.ui.notify("Setup cancelled.", "info");
+        return;
+      }
+
+      // Step 5: Provider
       const providerChoice = await ctx.ui.select("Embedding provider:", [
         "openai — OpenAI API (text-embedding-3-small)",
         "bedrock — AWS Bedrock (Titan Embeddings v2)",
@@ -211,6 +311,9 @@ export default function (pi: ExtensionAPI) {
             dirs,
             fileExtensions,
             excludeDirs,
+            logFile: logFile || undefined,
+            verboseLogging: verboseChoice === "yes",
+            quarantineEnabled: quarantineChoice === "yes",
             provider: {
               type: "openai",
               apiKey: apiKey?.startsWith("(") ? undefined : apiKey || undefined,
@@ -230,6 +333,9 @@ export default function (pi: ExtensionAPI) {
             dirs,
             fileExtensions,
             excludeDirs,
+            logFile: logFile || undefined,
+            verboseLogging: verboseChoice === "yes",
+            quarantineEnabled: quarantineChoice === "yes",
             provider: {
               type: "bedrock",
               profile: profile || "default",
@@ -249,6 +355,9 @@ export default function (pi: ExtensionAPI) {
             dirs,
             fileExtensions,
             excludeDirs,
+            logFile: logFile || undefined,
+            verboseLogging: verboseChoice === "yes",
+            quarantineEnabled: quarantineChoice === "yes",
             provider: {
               type: "ollama",
               url: url || "http://localhost:11434",
