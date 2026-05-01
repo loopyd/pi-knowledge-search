@@ -39,7 +39,7 @@ describe("JsonV4Adapter", () => {
 
   it("migrates forward from v3 content", async () => {
     const adapter = new JsonV4Adapter(`${tmpDir}/custom-v4.store`, 4);
-    const migrated = await adapter.migrateFrom(new JsonV3Adapter(`${tmpDir}/legacy.store`, 4), {
+    const migrated = await adapter.migrate(new JsonV3Adapter(`${tmpDir}/legacy.store`, 4), {
       ...makeIndexData(),
       version: 3,
     });

@@ -1,3 +1,4 @@
+import type * as fs from "node:fs";
 import type Database from "better-sqlite3";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 
@@ -5,17 +6,64 @@ export type ReindexState = "running" | "paused";
 
 export type KbAdapter = "json_v2" | "json_v3" | "jsonl_v4" | "sqlite_local";
 
+export type SearchAdapterKind = KbAdapter | "bedrock_v1";
+
 export type KbAdapterInput = KbAdapter | "jsonl_v3";
 
-export type AdapterKind = KbAdapter;
+export type AdapterKind = SearchAdapterKind;
 
 export type SyncPhase = "init" | "scan" | "queue" | "embed" | "upsert" | "done";
 
-export interface KnowledgeBaseConfig {
+export type BedrockKnowledgeBaseDataSourceType = "custom" | "s3";
+
+export type BedrockKnowledgeBaseSyncMode = "search" | "direct" | "ingestion_job";
+
+export type BedrockIngestionJobStatus =
+  | "STARTING"
+  | "IN_PROGRESS"
+  | "COMPLETE"
+  | "FAILED"
+  | "STOPPING"
+  | "STOPPED";
+
+export type BedrockDocumentStatus =
+  | "INDEXED"
+  | "PARTIALLY_INDEXED"
+  | "PENDING"
+  | "FAILED"
+  | "METADATA_PARTIALLY_INDEXED"
+  | "METADATA_UPDATE_FAILED"
+  | "IGNORED"
+  | "NOT_FOUND"
+  | "STARTING"
+  | "IN_PROGRESS"
+  | "DELETING"
+  | "DELETE_IN_PROGRESS";
+
+export interface KnowledgeBaseConfigFile {
   id: string;
   region?: string;
   profile?: string;
   label?: string;
+  dataSourceId?: string;
+  dataSourceType?: BedrockKnowledgeBaseDataSourceType;
+  syncMode?: BedrockKnowledgeBaseSyncMode;
+  ingestBatchSize?: number;
+  pollIntervalMs?: number;
+  maxWaitMs?: number;
+}
+
+export interface KnowledgeBaseConfig {
+  id: string;
+  region: string;
+  profile: string;
+  label?: string;
+  dataSourceId?: string;
+  dataSourceType?: BedrockKnowledgeBaseDataSourceType;
+  syncMode: BedrockKnowledgeBaseSyncMode;
+  ingestBatchSize: number;
+  pollIntervalMs: number;
+  maxWaitMs: number;
 }
 
 export interface OpenAIProviderConfig {
@@ -101,7 +149,7 @@ export interface ConfigFile {
   dimensions?: number;
   kbAdapter?: KbAdapterInput;
   kbAdapterSourceUri?: string;
-  knowledgeBases?: KnowledgeBaseConfig[];
+  knowledgeBases?: KnowledgeBaseConfigFile[];
   provider?: ProviderConfigFile;
 }
 
@@ -148,25 +196,6 @@ export interface IndexData {
   dimensions: number;
   reindexState: ReindexState;
   entries: Record<string, IndexEntry>;
-}
-
-export interface IndexAdapter<T, TClient = undefined> {
-  kind(): AdapterKind;
-  version(): number;
-  path(): string;
-  exists(): boolean;
-  empty(): T;
-  open?(): Promise<TClient | undefined>;
-  close?(): Promise<void>;
-  read(): Promise<T | null>;
-  write(data: T): Promise<void>;
-  create(data: T): Promise<void>;
-  update(data: T): Promise<void>;
-  delete(): Promise<void>;
-  canMigrateFrom<TAdapter extends IndexAdapter<T, unknown>>(adapter: TAdapter): boolean;
-  canMigrateTo<TAdapter extends IndexAdapter<T, unknown>>(adapter: TAdapter): boolean;
-  migrateFrom<TAdapter extends IndexAdapter<T, unknown>>(adapter: TAdapter, data: T): Promise<T>;
-  migrateTo<TAdapter extends IndexAdapter<T, unknown>>(adapter: TAdapter, data: T): Promise<T>;
 }
 
 export interface LegacyIndexEntry {
@@ -221,6 +250,58 @@ export interface SearchResult {
   heading: string;
 }
 
+export interface BedrockDocumentFailure {
+  identifier: string;
+  operation: "ingest" | "delete";
+  status: BedrockDocumentStatus;
+  reason?: string;
+}
+
+export interface BedrockKnowledgeBaseSyncResult {
+  knowledgeBaseId: string;
+  label?: string;
+  mode: BedrockKnowledgeBaseSyncMode;
+  status: BedrockDocumentStatus | BedrockIngestionJobStatus;
+  documentCount?: number;
+  failedDocumentCount?: number;
+  documentFailures?: BedrockDocumentFailure[];
+  jobId?: string;
+  details?: string;
+}
+
+export interface SyncSummary {
+  added: number;
+  updated: number;
+  removed: number;
+}
+
+export interface ScannedFile {
+  absPath: string;
+  relPath: string;
+  sourceDir: string;
+  mtime: number;
+}
+
+export interface AdapterSourceDescriptor {
+  selectedKind: AdapterKind;
+  selectedPath: string;
+}
+
+export type BedrockSyncConfig = Pick<Config, "dirs" | "fileExtensions" | "excludeDirs">;
+
+export interface IndexAdapterContext {
+  config: Config;
+  data: IndexData;
+  embedder: Embedder;
+  scheduleSave(): void;
+}
+
+export interface SearchAdapter<TContext = void> {
+  kind(): AdapterKind;
+  version(): number;
+  search(query: string, limit: number, context: TContext, signal?: AbortSignal): Promise<SearchResult[]>;
+}
+
 export interface SyncProgress {
   phase: SyncPhase;
   processed: number;
@@ -239,15 +320,84 @@ export interface SyncWorkerResult {
   chunks: number;
 }
 
+export interface KnowledgeSearchProgressMessage {
+  type: "knowledge-search-progress";
+  progress: SyncProgress;
+}
+
+export type BedrockClientFactory<TClient = unknown> = (
+  profile: string,
+  region: string
+) => Promise<TClient>;
+
+export type BedrockAgentRuntimeClientFactory<TClient = unknown> = BedrockClientFactory<TClient>;
+
+export type BedrockAgentClientFactory<TClient = unknown> = BedrockClientFactory<TClient>;
+
+export interface BedrockClientEntry {
+  client: unknown;
+  config: KnowledgeBaseConfig;
+}
+
+export interface BedrockLocalDocument {
+  absPath: string;
+  relPath: string;
+  sourceDir: string;
+  identifier: string;
+}
+
+export type WatchListener = (eventType: string, filename: string | Buffer | null) => void;
+
+export type WatchFactory = (
+  path: string,
+  options: fs.WatchOptions,
+  listener: WatchListener
+) => fs.FSWatcher;
+
+export interface IndexAdapter<T, TClient = undefined> extends SearchAdapter<IndexAdapterContext> {
+  kind(): AdapterKind;
+  version(): number;
+  path(): string;
+  exists(): boolean;
+  empty(): T;
+  open?(): Promise<TClient | undefined>;
+  close?(): Promise<void>;
+  read(): Promise<T | null>;
+  write(data: T): Promise<void>;
+  create(data: T): Promise<void>;
+  update(data: T): Promise<void>;
+  delete(): Promise<void>;
+  reindex(context: IndexAdapterContext): ReindexState;
+  reindex(state: ReindexState, context: IndexAdapterContext): void;
+  sync(context: IndexAdapterContext, onProgress?: (progress: SyncProgress) => void): Promise<SyncSummary>;
+  reset(context: IndexAdapterContext, onProgress?: (progress: SyncProgress) => void): Promise<void>;
+  ingest(absPath: string, sourceDir: string, context: IndexAdapterContext): Promise<void>;
+  remove(absPath: string, context: IndexAdapterContext): void;
+  accepts<TAdapter extends IndexAdapter<T, unknown>>(adapter: TAdapter): boolean;
+  migrate<TAdapter extends IndexAdapter<T, unknown>>(adapter: TAdapter, data: T): Promise<T>;
+}
+
+export type IndexAdapterCtor = new (
+  source: string,
+  dimensions: number
+) => IndexAdapter<IndexData, unknown>;
+
 export interface ControllableIndex {
   load(): Promise<void>;
+  flush?(): Promise<void>;
   reset?(onProgress?: (progress: SyncProgress) => void): Promise<void>;
-  reindexState?(): ReindexState;
-  setReindexState?(state: ReindexState): void;
+  reindex?(): ReindexState;
+  reindex?(state: ReindexState): void;
+}
+
+export interface RealtimeWatcher {
+  start(): void;
+  stop(): void;
 }
 
 export interface StartOptions {
   config: Config;
   index: ControllableIndex | null;
   ctx: any;
+  realtime?: RealtimeWatcher | null;
 }

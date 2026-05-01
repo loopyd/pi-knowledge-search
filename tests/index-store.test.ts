@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 import { KnowledgeIndex, dotProduct } from "../src/index-store.js";
 import {
   ChainAdapter,
@@ -13,7 +12,14 @@ import {
   JsonlIndexAdapter,
   SqliteV4Adapter,
 } from "../src/adapters/index.js";
-import type { Config, Embedder, IndexAdapter, IndexData } from "../src/types.js";
+import type { IndexAdapter, IndexData } from "../src/types.js";
+import {
+  makeLegacyV2Index,
+  makeTestConfig as makeConfig,
+  seedIndex as seed,
+  StubEmbedder,
+  TestEmbedder,
+} from "./helpers/index-fixtures.js";
 
 describe("dotProduct", () => {
   it("returns 0 for orthogonal vectors", () => {
@@ -49,81 +55,18 @@ describe("dotProduct", () => {
   });
 });
 
-class StubEmbedder implements Embedder {
-  async embed(): Promise<number[]> {
-    throw new Error("not used in these tests");
-  }
-
-  async embedBatch(): Promise<(number[] | null)[]> {
-    throw new Error("not used in these tests");
-  }
-}
-
-class TestEmbedder implements Embedder {
-  constructor(
-    private readonly embedImpl: (text: string, signal?: AbortSignal) => Promise<number[]>,
-    private readonly embedBatchImpl: (
-      texts: string[],
-      signal?: AbortSignal,
-      concurrency?: number
-    ) => Promise<(number[] | null)[]>
-  ) {}
-
-  async embed(text: string, signal?: AbortSignal): Promise<number[]> {
-    return await this.embedImpl(text, signal);
-  }
-
-  async embedBatch(
-    texts: string[],
-    signal?: AbortSignal,
-    concurrency?: number
-  ): Promise<(number[] | null)[]> {
-    return await this.embedBatchImpl(texts, signal, concurrency);
-  }
-}
-
-function makeConfig(dir: string, dimensions = 4): Config {
-  return {
-    dirs: ["/tmp/does-not-matter"],
-    fileExtensions: [".md"],
-    excludeDirs: [],
-    dimensions,
-    provider: null,
-    indexDir: dir,
-    kbAdapter: "jsonl_v4",
-    kbAdapterSourceUri: pathToFileURL(path.join(dir, "index.jsonl")).toString(),
-    knowledgeBases: [],
-  };
-}
-
-function makeLegacyV2Index(dimensions = 4) {
-  return {
-    version: 2,
-    dimensions,
-    entries: {
-      "/vault/legacy-v2.md": {
-        relPath: "legacy-v2.md",
-        sourceDir: "/vault",
-        mtime: 222,
-        vector: [1, 2, 3, 4],
-        excerpt: "legacy v2 excerpt",
-      },
-    },
-  };
-}
-
 function trackMigrations<TClient>(
   adapter: IndexAdapter<IndexData, TClient>,
   route: string[]
 ): IndexAdapter<IndexData, TClient> {
   const instrumented = adapter as IndexAdapter<IndexData, TClient> & {
-    migrateFrom: IndexAdapter<IndexData, TClient>["migrateFrom"];
+    migrate: IndexAdapter<IndexData, TClient>["migrate"];
   };
-  const migrateFrom = adapter.migrateFrom.bind(adapter);
+  const migrate = adapter.migrate.bind(adapter);
 
-  instrumented.migrateFrom = async (source, data) => {
+  instrumented.migrate = async (source, data) => {
     route.push(`${source.kind()}@${source.version()}->${adapter.kind()}@${adapter.version()}`);
-    return await migrateFrom(source, data);
+    return await migrate(source, data);
   };
 
   return adapter;
@@ -145,29 +88,6 @@ describe("KnowledgeIndex JSONL load/save and migration", () => {
   after(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
-
-  function seed(index: KnowledgeIndex, count: number, dims = 4): void {
-    const internal = index as unknown as {
-      data: {
-        version: number;
-        dimensions: number;
-        reindexState: "running" | "paused";
-        entries: Record<string, unknown>;
-      };
-    };
-    internal.data.reindexState = "paused";
-    for (let indexValue = 0; indexValue < count; indexValue += 1) {
-      internal.data.entries[`/vault/file-${indexValue}.md#0`] = {
-        relPath: `file-${indexValue}.md`,
-        sourceDir: "/vault",
-        mtime: 1_700_000_000_000 + indexValue,
-        vector: Array.from({ length: dims }, (_, dim) => Math.sin(indexValue + dim)),
-        excerpt: `Excerpt for file ${indexValue}.`,
-        heading: indexValue % 3 === 0 ? "intro" : `Section ${indexValue}`,
-        chunkIndex: 0,
-      };
-    }
-  }
 
   it("save + load round-trips entries unchanged", async () => {
     const config = makeConfig(tmpDir);
@@ -230,7 +150,7 @@ describe("KnowledgeIndex JSONL load/save and migration", () => {
       path.join(tmpDir, "index.jsonl"),
       `${JSON.stringify({ type: "meta", version: 4, dimensions: 1024 })}\n`
     );
-    const reader = new KnowledgeIndex(makeConfig(tmpDir, 4), new StubEmbedder());
+    const reader = new KnowledgeIndex(makeConfig(tmpDir, { dimensions: 4 }), new StubEmbedder());
     await reader.load();
     assert.equal(reader.chunkCount(), 0);
   });
@@ -245,7 +165,7 @@ describe("KnowledgeIndex JSONL load/save and migration", () => {
   });
 
   it("round-trips many entries through JSONL persistence", async () => {
-    const config = makeConfig(tmpDir, 256);
+    const config = makeConfig(tmpDir, { dimensions: 256 });
     const writer = new KnowledgeIndex(config, new StubEmbedder());
     seed(writer, 500, 256);
 
@@ -304,14 +224,14 @@ describe("KnowledgeIndex JSONL load/save and migration", () => {
       })
     );
 
-    const realThreshold = JsonlIndexAdapter.legacyJsonStreamingThresholdBytes;
-    JsonlIndexAdapter.legacyJsonStreamingThresholdBytes = 1;
+    const realThreshold = JsonlIndexAdapter.threshold;
+    JsonlIndexAdapter.threshold = 1;
     try {
       const reader = new KnowledgeIndex(makeConfig(tmpDir), new StubEmbedder());
       await reader.load();
       assert.equal(reader.chunkCount(), 1);
     } finally {
-      JsonlIndexAdapter.legacyJsonStreamingThresholdBytes = realThreshold;
+      JsonlIndexAdapter.threshold = realThreshold;
     }
   });
 
@@ -373,7 +293,7 @@ describe("KnowledgeIndex JSONL load/save and migration", () => {
   });
 
   it("round-trips entries through the sqlite_local adapter", async () => {
-    const config = { ...makeConfig(tmpDir), kbAdapter: "sqlite_local" as const, kbAdapterSourceUri: pathToFileURL(path.join(tmpDir, "index.sqlite")).toString() };
+    const config = makeConfig(tmpDir, { adapter: "sqlite_local" });
     const writer = new KnowledgeIndex(config, new StubEmbedder());
     seed(writer, 12);
 
@@ -408,13 +328,13 @@ describe("KnowledgeIndex runtime behavior", () => {
   it("persists reindex state changes on close without duplicating no-op updates", async () => {
     const index = new KnowledgeIndex(makeConfig(tmpDir), new StubEmbedder());
 
-    index.setReindexState("paused");
-    index.setReindexState("paused");
+    index.reindex("paused");
+    index.reindex("paused");
     await index.close();
 
     const reader = new KnowledgeIndex(makeConfig(tmpDir), new StubEmbedder());
     await reader.load();
-    assert.equal(reader.reindexState(), "paused");
+    assert.equal(reader.reindex(), "paused");
   });
 
   it("searches by score, deduplicates per file, and filters low scores", async () => {
@@ -522,7 +442,7 @@ describe("KnowledgeIndex runtime behavior", () => {
       )
     );
 
-    await index.updateFile(filePath, docsDir);
+    await index.ingest(filePath, docsDir);
 
     const internal = index as unknown as { data: IndexData };
     const keys = Object.keys(internal.data.entries);
@@ -554,19 +474,19 @@ describe("KnowledgeIndex runtime behavior", () => {
       )
     );
 
-    await index.updateFile(filePath, docsDir);
+    await index.ingest(filePath, docsDir);
     assert.equal(index.chunkCount(), 1);
 
     fs.writeFileSync(filePath, "too short");
-    await index.updateFile(filePath, docsDir);
+    await index.ingest(filePath, docsDir);
     assert.equal(index.chunkCount(), 0);
 
     fs.writeFileSync(filePath, "This is long enough to be indexed again after shrinking.");
-    await index.updateFile(filePath, docsDir);
+    await index.ingest(filePath, docsDir);
     assert.equal(index.chunkCount(), 1);
 
     fs.rmSync(filePath, { force: true });
-    await index.updateFile(filePath, docsDir);
+    await index.ingest(filePath, docsDir);
     assert.equal(index.chunkCount(), 0);
   });
 
@@ -693,7 +613,7 @@ describe("KnowledgeIndex runtime behavior", () => {
       chunkIndex: 0,
     };
 
-    await index.updateFile(hiddenFile, docsDir);
+    await index.ingest(hiddenFile, docsDir);
     assert.deepStrictEqual(Object.keys(internal.data.entries), ["/existing.md#0"]);
   });
 });

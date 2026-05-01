@@ -43,6 +43,22 @@ describe("JsonV2Adapter", () => {
     assert.equal(await adapter.read(), null);
   });
 
+  it("streams large legacy JSON payloads when the safety threshold is exceeded", async () => {
+    const sourcePath = `${tmpDir}/legacy-v2.store`;
+    fs.writeFileSync(sourcePath, JSON.stringify(makeLegacyV2Data()));
+
+    const originalLimit = JsonV2Adapter.limit;
+    JsonV2Adapter.limit = 1;
+    try {
+      const adapter = new JsonV2Adapter(sourcePath, 4);
+      const data = await adapter.read();
+      assert.ok(data);
+      assert.deepStrictEqual(data.entries["/vault/legacy.md#0"].vector, [10, 11, 12, 13]);
+    } finally {
+      JsonV2Adapter.limit = originalLimit;
+    }
+  });
+
   it("is a read-only adapter", async () => {
     const adapter = new JsonV2Adapter(`${tmpDir}/legacy-v2.store`, 4);
     await assert.rejects(() => adapter.write(), /read-only legacy adapter/);

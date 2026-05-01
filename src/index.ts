@@ -2,15 +2,24 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import { loadConfig, saveConfig, getConfigPath } from "./config.js";
+import { BedrockAdapter } from "./adapters/index.js";
 import { createEmbedder } from "./embedder.js";
 import { KnowledgeIndex } from "./index-store.js";
-import { BedrockKBSearcher } from "./kb-searcher.js";
 import { SyncController } from "./sync-controller.js";
-import type { Config, ConfigFile } from "./types.js";
+import { FileWatcher } from "./watcher.js";
+import type {
+  BedrockKnowledgeBaseDataSourceType,
+  KnowledgeBaseConfig,
+  BedrockKnowledgeBaseSyncMode,
+  BedrockKnowledgeBaseSyncResult,
+  Config,
+  ConfigFile,
+} from "./types.js";
 
 export default function (pi: ExtensionAPI) {
   let index: KnowledgeIndex | null = null;
-  let kbSearcher: BedrockKBSearcher | null = null;
+  let kbSearcher: BedrockAdapter | null = null;
+  let watcher: FileWatcher | null = null;
   let currentConfig: Config | null = null;
   const syncController = SyncController.shared();
 
@@ -21,6 +30,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     index = null;
     kbSearcher = null;
+    watcher = null;
     try {
       currentConfig = loadConfig();
     } catch {
@@ -32,30 +42,25 @@ export default function (pi: ExtensionAPI) {
       const embedder = createEmbedder(currentConfig.provider, currentConfig.dimensions);
       index = new KnowledgeIndex(currentConfig, embedder);
       await index.load();
+      watcher = new FileWatcher(currentConfig, index);
     }
 
     if (currentConfig.knowledgeBases.length > 0) {
-      kbSearcher = new BedrockKBSearcher(currentConfig.knowledgeBases);
+      kbSearcher = new BedrockAdapter(currentConfig.knowledgeBases);
     }
 
-    if (!index) {
-      await syncController.start({
-        config: currentConfig,
-        index,
-        ctx,
-      });
-      return; // KB-only mode — no local index to sync
-    }
     await syncController.start({
       config: currentConfig,
       index,
       ctx,
+      realtime: watcher,
     });
   });
 
   pi.on("session_shutdown", async () => {
     await syncController.stop();
-    // watcher removed (d38a81f) — caused UI freezes. Rely on sync-on-startup only.
+    watcher?.stop();
+    await kbSearcher?.close?.();
     await index?.close();
   });
 
@@ -185,7 +190,7 @@ export default function (pi: ExtensionAPI) {
   // Add Knowledge Base command
   // ------------------------------------------------------------------
 
-  pi.registerCommand("knowledge-add-kb", {
+  pi.registerCommand("knowledge-bedrock-setup", {
     description: "Add a Bedrock Knowledge Base as a search source",
     handler: async (_args, ctx) => {
       const kbId = await ctx.ui.input("Bedrock Knowledge Base ID:", "");
@@ -199,6 +204,41 @@ export default function (pi: ExtensionAPI) {
       const region = await ctx.ui.input("AWS region:", "us-east-1");
 
       const profile = await ctx.ui.input("AWS profile:", "default");
+
+      const syncChoice = await ctx.ui.select("Bedrock sync mode:", [
+        "search - query an existing knowledge base only",
+        "direct - push local files into a custom data source",
+        "ingestion_job - ask Bedrock to sync a staged data source",
+      ]);
+
+      if (!syncChoice) {
+        ctx.ui.notify("Cancelled.", "info");
+        return;
+      }
+
+      const syncMode = syncChoice.split(" ")[0] as BedrockKnowledgeBaseSyncMode;
+      let dataSourceId: string | undefined;
+      let dataSourceType: BedrockKnowledgeBaseDataSourceType | undefined;
+
+      if (syncMode !== "search") {
+        dataSourceId = await ctx.ui.input("Bedrock data source ID:", "");
+        if (!dataSourceId) {
+          ctx.ui.notify("Cancelled.", "info");
+          return;
+        }
+
+        const dataSourceChoice = await ctx.ui.select("Bedrock data source type:", [
+          "custom - direct document API support",
+          "s3 - staged S3 data source",
+        ]);
+
+        if (!dataSourceChoice) {
+          ctx.ui.notify("Cancelled.", "info");
+          return;
+        }
+
+        dataSourceType = dataSourceChoice.split(" ")[0] as BedrockKnowledgeBaseDataSourceType;
+      }
 
       // Load existing config or create minimal one
       let existing: ConfigFile;
@@ -227,12 +267,53 @@ export default function (pi: ExtensionAPI) {
         id: kbId,
         region: region || "us-east-1",
         profile: profile || "default",
+        syncMode,
         ...(label ? { label } : {}),
+        ...(dataSourceId ? { dataSourceId } : {}),
+        ...(dataSourceType ? { dataSourceType } : {}),
       });
 
       saveConfig(existing as ConfigFile);
       ctx.ui.notify(
         `Added KB ${kbId}${label ? ` (${label})` : ""}. Run /reload to activate.`,
+        "info"
+      );
+    },
+  });
+
+  pi.registerCommand("knowledge-bedrock-sync", {
+    description: "Sync configured Bedrock knowledge base data sources",
+    handler: async (_args, ctx) => {
+      if (!currentConfig || !kbSearcher || currentConfig.knowledgeBases.length === 0) {
+        ctx.ui.notify("No Bedrock knowledge bases are active. Run /knowledge-add-kb first.", "warning");
+        return;
+      }
+
+      const results = await kbSearcher.sync(currentConfig);
+      const failures = results.filter((result) => result.status === "FAILED");
+
+      ctx.ui.notify(formatKnowledgeBaseSyncResults(results), failures.length > 0 ? "warning" : "info");
+    },
+  });
+
+  pi.registerCommand("knowledge-bedrock-status", {
+    description: "Show the current Bedrock knowledge base configuration",
+    handler: async (_args, ctx) => {
+      let configured = currentConfig;
+
+      try {
+        configured = loadConfig();
+      } catch {
+        // Fall back to the active in-memory config if the file cannot be read.
+      }
+
+      if (!configured || configured.knowledgeBases.length === 0) {
+        ctx.ui.notify("No Bedrock knowledge bases are configured. Run /knowledge-add-kb first.", "warning");
+        return;
+      }
+
+      ctx.ui.notify(
+        formatKnowledgeBaseStatus(configured.knowledgeBases, currentConfig?.knowledgeBases ?? []),
         "info"
       );
     },
@@ -252,12 +333,13 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify("Starting or resuming re-index...", "info");
       try {
-        index.setReindexState("running");
+        index.reindex("running");
         await syncController.start(
           {
             config: currentConfig,
             index,
             ctx,
+            realtime: watcher,
           },
           { respectPausedState: false }
         );
@@ -295,6 +377,7 @@ export default function (pi: ExtensionAPI) {
           config: currentConfig,
           index,
           ctx,
+          realtime: watcher,
         });
 
         ctx.ui.notify(
@@ -321,6 +404,7 @@ export default function (pi: ExtensionAPI) {
           config: currentConfig,
           index,
           ctx,
+          realtime: watcher,
         });
         ctx.ui.notify(
           "Re-index restarted from a fresh index. Use /knowledge-reindex-stop to pause.",
@@ -372,10 +456,9 @@ export default function (pi: ExtensionAPI) {
       const limit = Math.min(params.limit ?? 8, 20);
 
       try {
-        // Search local index and Bedrock KBs in parallel
         const [localResults, kbResults] = await Promise.all([
           hasLocalIndex ? index!.search(params.query, limit, signal) : [],
-          hasKB ? kbSearcher!.search(params.query, limit, signal) : [],
+          hasKB ? kbSearcher!.search(params.query, limit, undefined, signal) : [],
         ]);
 
         // Merge and sort by score, take top N
@@ -421,4 +504,76 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+}
+
+function formatKnowledgeBaseSyncResults(results: BedrockKnowledgeBaseSyncResult[]): string {
+  return results
+    .map((result) => {
+      const label = result.label ? `${result.label} (${result.knowledgeBaseId})` : result.knowledgeBaseId;
+      const count = result.documentCount != null ? `, docs=${result.documentCount}` : "";
+      const failed = result.failedDocumentCount ? `, failed=${result.failedDocumentCount}` : "";
+      const job = result.jobId ? `, job=${result.jobId}` : "";
+      const detail = result.details ? `, ${result.details}` : "";
+      const documentFailures = formatKnowledgeBaseDocumentFailures(result);
+      return `${label}: ${result.status}${count}${failed}${job}${detail}${documentFailures}`;
+    })
+    .join("\n");
+}
+
+function formatKnowledgeBaseDocumentFailures(result: BedrockKnowledgeBaseSyncResult): string {
+  if (!result.documentFailures || result.documentFailures.length === 0) {
+    return "";
+  }
+
+  const limit = 5;
+  const lines = result.documentFailures.slice(0, limit).map((failure) => {
+    const reason = failure.reason ? `: ${failure.reason}` : "";
+    return `\n  - ${failure.operation} ${failure.identifier} [${failure.status}]${reason}`;
+  });
+
+  if (result.documentFailures.length > limit) {
+    lines.push(`\n  - ... ${result.documentFailures.length - limit} more document failure(s)`);
+  }
+
+  return lines.join("");
+}
+
+function formatKnowledgeBaseStatus(
+  configured: KnowledgeBaseConfig[],
+  active: KnowledgeBaseConfig[]
+): string {
+  const activeConfigs = new Set(active.map((entry) => knowledgeBaseSignature(entry)));
+
+  return configured
+    .map((entry) => {
+      const label = entry.label ? `${entry.label} (${entry.id})` : entry.id;
+      const loaded = activeConfigs.has(knowledgeBaseSignature(entry)) ? "active" : "saved";
+      const source = entry.dataSourceId
+        ? `, source=${entry.dataSourceType ?? "unknown"}/${entry.dataSourceId}`
+        : "";
+      const syncTuning =
+        entry.syncMode === "direct"
+          ? `, batch=${entry.ingestBatchSize}`
+          : entry.syncMode === "ingestion_job"
+            ? `, poll=${entry.pollIntervalMs}ms, wait=${entry.maxWaitMs}ms`
+            : "";
+
+      return `${label}: ${loaded}, mode=${entry.syncMode}, region=${entry.region}, profile=${entry.profile}${source}${syncTuning}`;
+    })
+    .join("\n");
+}
+
+function knowledgeBaseSignature(entry: KnowledgeBaseConfig): string {
+  return [
+    entry.id,
+    entry.label ?? "",
+    entry.region,
+    entry.profile,
+    entry.syncMode,
+    entry.dataSourceId ?? "",
+    entry.dataSourceType ?? "",
+    String(entry.ingestBatchSize),
+    String(entry.pollIntervalMs),
+    String(entry.maxWaitMs),
+  ].join("|");
 }

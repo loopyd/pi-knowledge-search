@@ -1,7 +1,7 @@
 import { after, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import { JsonlIndexAdapter } from "../../src/adapters/index.js";
+import { JsonV2Adapter, JsonV3Adapter, JsonlIndexAdapter } from "../../src/adapters/index.js";
 import { clearTempDir, makeIndexData, makeTempDir, removeTempDir } from "../helpers/adapter-fixtures.js";
 
 describe("JsonlIndexAdapter", () => {
@@ -33,12 +33,18 @@ describe("JsonlIndexAdapter", () => {
   });
 
   it("exposes the legacy streaming threshold passthrough", () => {
-    const realThreshold = JsonlIndexAdapter.legacyJsonStreamingThresholdBytes;
-    JsonlIndexAdapter.legacyJsonStreamingThresholdBytes = 321;
+    const realThreshold = JsonlIndexAdapter.threshold;
+    const realV2Threshold = JsonV2Adapter.limit;
+    const realV3Threshold = JsonV3Adapter.limit;
+    JsonlIndexAdapter.threshold = 321;
     try {
-      assert.equal(JsonlIndexAdapter.legacyJsonStreamingThresholdBytes, 321);
+      assert.equal(JsonlIndexAdapter.threshold, 321);
+      assert.equal(JsonV2Adapter.limit, 321);
+      assert.equal(JsonV3Adapter.limit, 321);
     } finally {
-      JsonlIndexAdapter.legacyJsonStreamingThresholdBytes = realThreshold;
+      JsonlIndexAdapter.threshold = realThreshold;
+      JsonV2Adapter.limit = realV2Threshold;
+      JsonV3Adapter.limit = realV3Threshold;
     }
   });
 });

@@ -30,7 +30,7 @@ describe("SqliteV4Adapter", () => {
 
   it("accepts migrations from jsonl v4 data", async () => {
     const adapter = new SqliteV4Adapter(`${tmpDir}/custom-index.db`, 4);
-    const migrated = await adapter.migrateFrom(new JsonV4Adapter(`${tmpDir}/legacy.store`, 4), makeIndexData());
+    const migrated = await adapter.migrate(new JsonV4Adapter(`${tmpDir}/legacy.store`, 4), makeIndexData());
     assert.equal(migrated.version, 4);
     await adapter.close();
   });

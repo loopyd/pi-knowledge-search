@@ -1,5 +1,4 @@
 import type { Embedder, ProviderConfig } from "./types.js";
-import { createBedrockRuntimeClient } from "./bedrock.js";
 
 export type { Embedder } from "./types.js";
 
@@ -74,6 +73,27 @@ async function parallelMap<T, R>(
 
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
   return results;
+}
+
+async function createBedrockRuntimeClient(profile: string, region: string): Promise<any> {
+  const { BedrockRuntimeClient } = await import("@aws-sdk/client-bedrock-runtime");
+  return new BedrockRuntimeClient(await bedrockClientOptions(profile, region));
+}
+
+async function bedrockClientOptions(
+  profile: string,
+  region: string
+): Promise<{ region: string; credentials?: any }> {
+  const normalizedProfile = profile.trim();
+  if (normalizedProfile.length === 0 || normalizedProfile === "default") {
+    return { region };
+  }
+
+  const { fromIni } = await import("@aws-sdk/credential-providers");
+  return {
+    region,
+    credentials: fromIni({ profile: normalizedProfile }),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +183,6 @@ class OpenAIEmbedder implements Embedder {
 // ---------------------------------------------------------------------------
 
 class BedrockEmbedder implements Embedder {
-  private client: any; // Lazy-loaded to avoid hard dep if not using Bedrock
   private model: string;
   private dimensions: number;
   private clientPromise: Promise<any>;

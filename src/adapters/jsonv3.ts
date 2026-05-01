@@ -1,13 +1,26 @@
 import * as fs from "node:fs";
 import Assembler from "stream-json/assembler.js";
 import makeParser from "stream-json/index.js";
-import { AdapterBase, JSON_V2_VERSION, LEGACY_JSON_VERSION } from "./base.js";
-import type { AdapterSourceDescriptor } from "./base.js";
-import type { IndexAdapter, IndexData, JsonV3Data } from "../types.js";
+import { AdapterBase, JSON_STREAM_CHUNK_BYTES, JSON_V2_VERSION, LEGACY_JSON_VERSION } from "./base.js";
+import type { AdapterSourceDescriptor, IndexAdapter, IndexData, JsonV3Data } from "../types.js";
 
+/**
+ * Adapter for the v3 legacy JSON object format.
+ *
+ * v3 is still a whole-file JSON document, so it keeps the same size-gated
+ * streaming safety net as the main index-store fix while preserving the older
+ * on-disk layout for migration compatibility.
+ */
 export class JsonV3Adapter extends AdapterBase<IndexData> {
+  /* Fall back to streaming before V8 string limits can crash large legacy loads. */
   static limit = 256 * 1024 * 1024;
 
+  /**
+   * Wrap a v3 JSON source or an inherited descriptor from a chain adapter.
+   *
+   * Descriptors keep the adapter wired to the same logical source path when the
+   * chain is probing older sibling formats during migration.
+   */
   constructor(source: string | AdapterSourceDescriptor, dimensions: number) {
     super(source, dimensions, "index.json", "json_v3", LEGACY_JSON_VERSION);
   }
@@ -19,7 +32,20 @@ export class JsonV3Adapter extends AdapterBase<IndexData> {
       let raw: JsonV3Data | null = null;
       const size = fs.statSync(this.path()).size;
       if (size >= JsonV3Adapter.limit) {
-        raw = await this.stream(this.path());
+        raw = await new Promise<JsonV3Data | null>((resolve, reject) => {
+          const stream = fs.createReadStream(this.path(), {
+            highWaterMark: JSON_STREAM_CHUNK_BYTES,
+          });
+          const parser = makeParser();
+          const assembler = Assembler.connectTo(parser);
+
+          assembler.on("done", (result) => {
+            resolve(result.current as JsonV3Data);
+          });
+          stream.on("error", reject);
+          parser.on("error", reject);
+          stream.pipe(parser);
+        });
       } else {
         raw = JSON.parse(fs.readFileSync(this.path(), "utf-8")) as JsonV3Data;
       }
@@ -34,6 +60,7 @@ export class JsonV3Adapter extends AdapterBase<IndexData> {
     }
   }
 
+  /* Prefer the fast stringify path and only stream out key-by-key on RangeError. */
   async write(data: IndexData): Promise<void> {
     const raw: JsonV3Data = {
       version: LEGACY_JSON_VERSION,
@@ -54,14 +81,14 @@ export class JsonV3Adapter extends AdapterBase<IndexData> {
     });
   }
 
-  override canMigrateFrom<TAdapter extends IndexAdapter<IndexData, unknown>>(adapter: TAdapter): boolean {
+  override accepts<TAdapter extends IndexAdapter<IndexData, unknown>>(adapter: TAdapter): boolean {
     return (
-      super.canMigrateFrom(adapter) ||
+      super.accepts(adapter) ||
       (adapter.kind() === "json_v2" && adapter.version() === JSON_V2_VERSION)
     );
   }
 
-  override async migrateFrom<TAdapter extends IndexAdapter<IndexData, unknown>>(
+  override async migrate<TAdapter extends IndexAdapter<IndexData, unknown>>(
     adapter: TAdapter,
     data: IndexData
   ): Promise<IndexData> {
@@ -69,9 +96,10 @@ export class JsonV3Adapter extends AdapterBase<IndexData> {
       return this.migrated(data, LEGACY_JSON_VERSION);
     }
 
-    return await super.migrateFrom(adapter, data);
+    return await super.migrate(adapter, data);
   }
 
+  /* Validate the legacy v3 shape before normalizing it back into the in-memory form. */
   private match(value: JsonV3Data | null): value is JsonV3Data {
     return Boolean(
       value &&
@@ -84,21 +112,7 @@ export class JsonV3Adapter extends AdapterBase<IndexData> {
     );
   }
 
-  private stream(file: string): Promise<JsonV3Data | null> {
-    return new Promise((resolve, reject) => {
-      const stream = fs.createReadStream(file, { highWaterMark: 256 * 1024 });
-      const parser = makeParser();
-      const assembler = Assembler.connectTo(parser);
-
-      assembler.on("done", (result) => {
-        resolve(result.current as JsonV3Data);
-      });
-      stream.on("error", reject);
-      parser.on("error", reject);
-      stream.pipe(parser);
-    });
-  }
-
+  /* Stream the legacy object out incrementally when stringify would exceed V8 string limits. */
   private async dump(file: string, data: JsonV3Data): Promise<void> {
     const stream = fs.createWriteStream(file);
     let fail: Error | null = null;

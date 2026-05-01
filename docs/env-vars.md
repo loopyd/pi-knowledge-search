@@ -1,15 +1,15 @@
 # Environment Variable Reference
 
-All settings can be overridden via environment variables. The config file (`~/.pi/knowledge-search.json`) is checked first, then env vars override individual fields.
+All settings can be overridden via environment variables. By default the loader prefers the nearest project `.pi/knowledge-search.json`; if only `.pi/settings.json` exists, it uses sibling `.pi/knowledge-search.json` as the project target; otherwise it falls back to `~/.pi/knowledge-search.json`. Relative paths in the config file resolve from that config directory, then env vars override individual fields.
 
 | Variable                      | Description                                                       | Default                              |
 | ----------------------------- | ----------------------------------------------------------------- | ------------------------------------ |
-| `KNOWLEDGE_SEARCH_CONFIG`     | Path to config file                                               | `~/.pi/knowledge-search.json`        |
+| `KNOWLEDGE_SEARCH_CONFIG`     | Path to config file                                               | nearest project `.pi/knowledge-search.json`, else `~/.pi/knowledge-search.json` |
 | `KNOWLEDGE_SEARCH_DIRS`       | Comma-separated directories to index                              | _(from config file)_                 |
 | `KNOWLEDGE_SEARCH_EXTENSIONS` | Comma-separated file extensions                                   | `.md,.txt`                           |
 | `KNOWLEDGE_SEARCH_EXCLUDE`    | Comma-separated directory names to skip                           | `node_modules,.git,.obsidian,.trash` |
 | `KNOWLEDGE_SEARCH_DIMENSIONS` | Embedding vector dimensions                                       | `512`                                |
-| `KNOWLEDGE_SEARCH_INDEX_DIR`  | Where to store the index                                          | `~/.pi/knowledge-search`             |
+| `KNOWLEDGE_SEARCH_INDEX_DIR`  | Where to store the index                                          | `knowledge-search/` beside the active config file |
 | `KNOWLEDGE_SEARCH_PROVIDER`   | Provider type: `openai`, `openai-compatible`, `bedrock`, `ollama` | `openai`                             |
 
 ### OpenAI
@@ -49,7 +49,7 @@ export KNOWLEDGE_SEARCH_COMPAT_API_KEY=my-local-key
 export KNOWLEDGE_SEARCH_COMPAT_MODEL=qwen3-embeddings
 ```
 
-Or via config file (`~/.pi/knowledge-search.json`):
+Or via config file (project `.pi/knowledge-search.json` or `~/.pi/knowledge-search.json`):
 
 ```json
 {

@@ -22,6 +22,7 @@
     "@sinclair/typebox": "*"
   },
   "optionalDependencies": {
+    "@aws-sdk/client-bedrock-agent": "^3.750.0",
     "@aws-sdk/client-bedrock-agent-runtime": "3.750.0",
     "@aws-sdk/client-bedrock-runtime": "3.750.0",
     "@aws-sdk/credential-providers": "3.750.0"
@@ -30,6 +31,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.9.0",
     "drizzle-orm": "^0.45.2",
+    "mime": "^4.1.0",
     "remark-frontmatter": "^5.0.0",
     "remark-parse": "^11.0.0",
     "stream-json": "^2.1.0",
@@ -38,6 +40,7 @@
   },
   "scripts": {
     "test": "node --test --import tsx tests/*.test.ts tests/**/*.test.ts",
+    "test:behavioral": "RUN_PI_BEHAVIORAL_TESTS=1 node --test --import tsx tests/pause-resume.behavior.test.ts",
     "test:coverage": "node --test --experimental-test-coverage --import tsx tests/*.test.ts tests/**/*.test.ts",
     "test:coverage:ci": "node --test --experimental-test-coverage --test-coverage-lines=95 --test-coverage-branches=84 --test-coverage-functions=90 --import tsx tests/*.test.ts tests/**/*.test.ts",
     "build:worker": "esbuild src/sync-worker.ts --bundle --platform=node --format=esm --outfile=dist/sync-worker.mjs --external:better-sqlite3 --packages=external",

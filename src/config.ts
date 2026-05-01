@@ -1,16 +1,37 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { Config, ConfigFile, KbAdapter, KbAdapterInput, ProviderConfig } from "./types.js";
+import type {
+  Config,
+  ConfigFile,
+  KbAdapter,
+  KbAdapterInput,
+  KnowledgeBaseConfig,
+  KnowledgeBaseConfigFile,
+  ProviderConfig,
+} from "./types.js";
 
 export type { Config, ConfigFile, KbAdapter, ProviderConfig } from "./types.js";
 
-const CONFIG_PATH =
-  process.env.KNOWLEDGE_SEARCH_CONFIG ||
-  path.join(process.env.HOME || "/tmp", ".pi", "knowledge-search.json");
+const CONFIG_DIR_NAME = ".pi";
+const CONFIG_FILENAME = "knowledge-search.json";
+const SETTINGS_FILENAME = "settings.json";
+
+interface ConfigContext {
+  configPath: string;
+  configDir: string;
+}
+
+let resolvedConfigContext: ConfigContext | null = null;
 
 export function getConfigPath(): string {
-  return CONFIG_PATH;
+  if (resolvedConfigContext) {
+    return resolvedConfigContext.configPath;
+  }
+
+  const context = getConfigContext();
+  resolvedConfigContext = context;
+  return context.configPath;
 }
 
 /**
@@ -18,11 +39,14 @@ export function getConfigPath(): string {
  * Returns null if no config file exists (needs setup).
  */
 export function loadConfig(): Config | null {
+  const { configPath, configDir } = getConfigContext();
+  resolvedConfigContext = { configPath, configDir };
+
   // Try config file first
   let file: ConfigFile | null = null;
-  if (fs.existsSync(CONFIG_PATH)) {
+  if (fs.existsSync(configPath)) {
     try {
-      file = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+      file = JSON.parse(fs.readFileSync(configPath, "utf-8"));
     } catch {
       // Corrupted file
     }
@@ -42,10 +66,13 @@ export function loadConfig(): Config | null {
 
   // Build config: file values, then env overrides
   const home = process.env.HOME || "/tmp";
-  const resolvePath = (p: string) => p.replace(/^~/, home);
+  const envBaseDir = process.cwd();
+  const resolveConfigPath = (value: string) => resolveLocalPath(value, configDir, home);
+  const resolveEnvPath = (value: string) => resolveLocalPath(value, envBaseDir, home);
 
   const dirs = (envDirs ? envDirs.split(",").map((d) => d.trim()) : (file?.dirs ?? []))
-    .map(resolvePath)
+    .filter(Boolean)
+    .map(envDirs ? resolveEnvPath : resolveConfigPath)
     .filter(Boolean);
 
   if (dirs.length === 0 && !hasKBs && !hasAdapterSource) return null;
@@ -64,13 +91,16 @@ export function loadConfig(): Config | null {
   const kbAdapter = normalizeKbAdapter(
     kbAdapterInput(envStr("KB_ADAPTER") ?? envStr("KNOWLEDGE_SEARCH_KB_ADAPTER") ?? file?.kbAdapter)
   );
-  const defaultIndexDir =
-    envStr("KNOWLEDGE_SEARCH_INDEX_DIR") ?? path.join(home, ".pi", "knowledge-search");
+  const envIndexDir = envStr("KNOWLEDGE_SEARCH_INDEX_DIR");
+  const defaultIndexDir = envIndexDir
+    ? resolveEnvPath(envIndexDir)
+    : path.join(configDir, "knowledge-search");
   const kbAdapterSourceUri = normalizeKbAdapterSourceUri(
     envAdapterSourceUri ?? file?.kbAdapterSourceUri,
     kbAdapter,
     defaultIndexDir,
-    home
+    home,
+    envAdapterSourceUri ? envBaseDir : configDir
   );
 
   const providerType =
@@ -186,7 +216,7 @@ export function loadConfig(): Config | null {
     indexDir,
     kbAdapter,
     kbAdapterSourceUri,
-    knowledgeBases: file?.knowledgeBases ?? [],
+    knowledgeBases: normalizeKnowledgeBases(file?.knowledgeBases ?? []),
   };
 }
 
@@ -194,9 +224,31 @@ export function loadConfig(): Config | null {
  * Save config to file.
  */
 export function saveConfig(config: ConfigFile): void {
-  const dir = path.dirname(CONFIG_PATH);
+  const configPath = getConfigPath();
+  const dir = path.dirname(configPath);
+  resolvedConfigContext = { configPath, configDir: dir };
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+}
+
+function getConfigContext(): ConfigContext {
+  const home = process.env.HOME || "/tmp";
+  const configuredPath = envStr("KNOWLEDGE_SEARCH_CONFIG");
+  if (configuredPath) {
+    const configPath = resolveLocalPath(configuredPath, process.cwd(), home);
+    return { configPath, configDir: path.dirname(configPath) };
+  }
+
+  const projectPiDir = findProjectPiDir();
+  if (projectPiDir) {
+    return {
+      configPath: path.join(projectPiDir, CONFIG_FILENAME),
+      configDir: projectPiDir,
+    };
+  }
+
+  const configPath = path.join(home, CONFIG_DIR_NAME, CONFIG_FILENAME);
+  return { configPath, configDir: path.dirname(configPath) };
 }
 
 function envStr(key: string): string | undefined {
@@ -207,6 +259,56 @@ function envStr(key: string): string | undefined {
 function envInt(key: string): number | undefined {
   const v = envStr(key);
   return v ? parseInt(v, 10) : undefined;
+}
+
+function normalizeKnowledgeBases(values: KnowledgeBaseConfigFile[]): KnowledgeBaseConfig[] {
+  return values.map((value) => normalizeKnowledgeBase(value));
+}
+
+function normalizeKnowledgeBase(value: KnowledgeBaseConfigFile): KnowledgeBaseConfig {
+  const id = value.id?.trim();
+  if (!id) {
+    throw new Error("Knowledge base id is required.");
+  }
+
+  const syncMode = value.syncMode ?? "search";
+  if (syncMode !== "search" && !value.dataSourceId) {
+    throw new Error(
+      `Knowledge base ${id} sets syncMode=\"${syncMode}\" but is missing dataSourceId.`
+    );
+  }
+
+  if (syncMode !== "search" && !value.dataSourceType) {
+    throw new Error(
+      `Knowledge base ${id} sets syncMode=\"${syncMode}\" but is missing dataSourceType.`
+    );
+  }
+
+  return {
+    id,
+    profile: value.profile?.trim() || "default",
+    region: value.region?.trim() || "us-east-1",
+    ...(value.label?.trim() ? { label: value.label.trim() } : {}),
+    ...(value.dataSourceId?.trim() ? { dataSourceId: value.dataSourceId.trim() } : {}),
+    ...(value.dataSourceType ? { dataSourceType: value.dataSourceType } : {}),
+    syncMode,
+    ingestBatchSize: normalizeIngestBatchSize(value.ingestBatchSize),
+    pollIntervalMs: normalizePositiveInt(value.pollIntervalMs, 2_000),
+    maxWaitMs: normalizePositiveInt(value.maxWaitMs, 300_000),
+  };
+}
+
+function normalizeIngestBatchSize(value: number | undefined): number {
+  const normalized = normalizePositiveInt(value, 25);
+  return Math.min(normalized, 25);
+}
+
+function normalizePositiveInt(value: number | undefined, fallback: number): number {
+  if (!Number.isFinite(value) || value == null) {
+    return fallback;
+  }
+
+  return Math.max(1, Math.trunc(value));
 }
 
 function normalizeKbAdapter(value?: KbAdapterInput): KbAdapter {
@@ -254,10 +356,11 @@ function normalizeKbAdapterSourceUri(
   value: string | undefined,
   adapter: KbAdapter,
   defaultIndexDir: string,
-  home: string
+  home: string,
+  baseDir: string
 ): string {
   const fallbackPath = path.join(defaultIndexDir, kbAdapterFilename(adapter));
-  const localPath = value ? resolveLocalPath(value, home) : fallbackPath;
+  const localPath = value ? resolveLocalPath(value, baseDir, home) : fallbackPath;
   return pathToFileURL(localPath).toString();
 }
 
@@ -269,10 +372,49 @@ function adapterDirectoryFromSourceUri(uri: string): string {
   return path.dirname(fileURLToPath(uri));
 }
 
-function resolveLocalPath(value: string, home: string): string {
+function resolveLocalPath(value: string, baseDir: string, home: string): string {
   if (value.startsWith("file:")) {
     return fileURLToPath(value);
   }
 
-  return path.resolve(value.replace(/^~/, home));
+  const expanded = expandHomePath(value, home);
+  if (path.isAbsolute(expanded) || isWindowsAbsolutePath(expanded)) {
+    return path.normalize(expanded);
+  }
+
+  return path.resolve(baseDir, expanded);
+}
+
+function findProjectPiDir(startDir = process.cwd()): string | null {
+  let current = path.resolve(startDir);
+  let nearestPiSettingsDir: string | null = null;
+
+  while (true) {
+    const piDir = path.join(current, CONFIG_DIR_NAME);
+    if (fs.existsSync(path.join(piDir, CONFIG_FILENAME))) {
+      return piDir;
+    }
+
+    if (!nearestPiSettingsDir && fs.existsSync(path.join(piDir, SETTINGS_FILENAME))) {
+      nearestPiSettingsDir = piDir;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return nearestPiSettingsDir;
+    }
+    current = parent;
+  }
+}
+
+function expandHomePath(value: string, home: string): string {
+  if (!value.startsWith("~")) {
+    return value;
+  }
+
+  return path.join(home, value.slice(1).replace(/^[/\\]+/, ""));
+}
+
+function isWindowsAbsolutePath(value: string): boolean {
+  return /^[A-Za-z]:[/\\]/.test(value);
 }

@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ks-config-test-"));
 const configFile = path.join(tmpDir, "config.json");
+const originalCwd = process.cwd();
 
 const envKeys = [
   "KB_ADAPTER",
@@ -59,6 +60,8 @@ describe("config", () => {
   });
 
   beforeEach(() => {
+    process.chdir(originalCwd);
+
     for (const key of envKeys) {
       if (key !== "KNOWLEDGE_SEARCH_CONFIG") {
         delete process.env[key];
@@ -71,6 +74,8 @@ describe("config", () => {
   });
 
   after(() => {
+    process.chdir(originalCwd);
+
     for (const key of envKeys) {
       if (originalEnv[key] === undefined) {
         delete process.env[key];
@@ -172,6 +177,103 @@ describe("config", () => {
     }
   });
 
+  it("prefers project-level .pi config and resolves relative paths from that directory", () => {
+    const originalConfigEnv = process.env.KNOWLEDGE_SEARCH_CONFIG;
+    const originalHome = process.env.HOME;
+    const projectDir = fs.mkdtempSync(path.join(tmpDir, "project-config-"));
+    const projectPiDir = path.join(projectDir, ".pi");
+    const nestedWorkingDir = path.join(projectDir, "packages", "feature");
+    const homeDir = fs.mkdtempSync(path.join(tmpDir, "home-config-"));
+    fs.mkdirSync(projectPiDir, { recursive: true });
+    fs.mkdirSync(nestedWorkingDir, { recursive: true });
+    fs.mkdirSync(path.join(homeDir, ".pi"), { recursive: true });
+
+    fs.writeFileSync(
+      path.join(homeDir, ".pi", "knowledge-search.json"),
+      JSON.stringify({
+        dirs: ["/tmp/home-docs"],
+        provider: { type: "openai", apiKey: "sk-home" },
+      })
+    );
+    fs.writeFileSync(
+      path.join(projectPiDir, "settings.json"),
+      JSON.stringify({ project: { cwd: projectDir } })
+    );
+    fs.writeFileSync(
+      path.join(projectPiDir, "knowledge-search.json"),
+      JSON.stringify({
+        dirs: ["../docs"],
+        kbAdapter: "jsonl_v4",
+        kbAdapterSourceUri: "knowledge-search/project-index/index.jsonl",
+        provider: { type: "openai", apiKey: "sk-project" },
+      })
+    );
+
+    delete process.env.KNOWLEDGE_SEARCH_CONFIG;
+    process.env.HOME = homeDir;
+    process.chdir(nestedWorkingDir);
+
+    try {
+      assert.equal(getConfigPath(), path.join(projectPiDir, "knowledge-search.json"));
+
+      const config = loadConfig();
+      assert.ok(config);
+      assert.deepStrictEqual(config.dirs, [path.join(projectDir, "docs")]);
+      assert.equal(
+        config.kbAdapterSourceUri,
+        pathToFileURL(path.join(projectPiDir, "knowledge-search", "project-index", "index.jsonl"))
+          .toString()
+      );
+      assert.equal(config.indexDir, path.join(projectPiDir, "knowledge-search", "project-index"));
+    } finally {
+      if (originalConfigEnv === undefined) {
+        delete process.env.KNOWLEDGE_SEARCH_CONFIG;
+      } else {
+        process.env.KNOWLEDGE_SEARCH_CONFIG = originalConfigEnv;
+      }
+      process.env.HOME = originalHome;
+      process.chdir(originalCwd);
+    }
+  });
+
+  it("saveConfig writes to the project .pi directory when project settings exist", () => {
+    const originalConfigEnv = process.env.KNOWLEDGE_SEARCH_CONFIG;
+    const projectDir = fs.mkdtempSync(path.join(tmpDir, "project-save-"));
+    const projectPiDir = path.join(projectDir, ".pi");
+    const nestedWorkingDir = path.join(projectDir, "tools", "scripts");
+    fs.mkdirSync(projectPiDir, { recursive: true });
+    fs.mkdirSync(nestedWorkingDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectPiDir, "settings.json"),
+      JSON.stringify({ project: { cwd: projectDir } })
+    );
+
+    delete process.env.KNOWLEDGE_SEARCH_CONFIG;
+    process.chdir(nestedWorkingDir);
+
+    try {
+      saveConfig({
+        dirs: ["../docs"],
+        provider: { type: "openai", apiKey: "sk-saved" },
+      });
+
+      const savedPath = path.join(projectPiDir, "knowledge-search.json");
+      assert.equal(getConfigPath(), savedPath);
+      assert.ok(fs.existsSync(savedPath));
+
+      const parsed = JSON.parse(fs.readFileSync(savedPath, "utf-8"));
+      assert.deepStrictEqual(parsed.dirs, ["../docs"]);
+      assert.equal(parsed.provider.type, "openai");
+    } finally {
+      if (originalConfigEnv === undefined) {
+        delete process.env.KNOWLEDGE_SEARCH_CONFIG;
+      } else {
+        process.env.KNOWLEDGE_SEARCH_CONFIG = originalConfigEnv;
+      }
+      process.chdir(originalCwd);
+    }
+  });
+
   it("throws for openai provider without API key", () => {
     fs.writeFileSync(
       configFile,
@@ -201,6 +303,79 @@ describe("config", () => {
     const config = loadConfig();
     assert.ok(config);
     assert.equal(config.provider?.type, "bedrock");
+  });
+
+  it("normalizes knowledge base defaults for search-only entries", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        knowledgeBases: [{ id: "kb-defaults" }],
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.deepStrictEqual(config.knowledgeBases, [
+      {
+        id: "kb-defaults",
+        profile: "default",
+        region: "us-east-1",
+        syncMode: "search",
+        ingestBatchSize: 25,
+        pollIntervalMs: 2000,
+        maxWaitMs: 300000,
+      },
+    ]);
+  });
+
+  it("preserves explicit Bedrock knowledge base ingestion settings", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        knowledgeBases: [
+          {
+            id: "kb-custom",
+            label: "Team docs",
+            profile: "work",
+            region: "us-west-2",
+            dataSourceId: "ds-123",
+            dataSourceType: "custom",
+            syncMode: "direct",
+            ingestBatchSize: 10,
+            pollIntervalMs: 500,
+            maxWaitMs: 1000,
+          },
+        ],
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.deepStrictEqual(config.knowledgeBases, [
+      {
+        id: "kb-custom",
+        label: "Team docs",
+        profile: "work",
+        region: "us-west-2",
+        dataSourceId: "ds-123",
+        dataSourceType: "custom",
+        syncMode: "direct",
+        ingestBatchSize: 10,
+        pollIntervalMs: 500,
+        maxWaitMs: 1000,
+      },
+    ]);
+  });
+
+  it("throws when a knowledge base sync mode requires a data source id", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        knowledgeBases: [{ id: "kb-invalid", syncMode: "direct", dataSourceType: "custom" }],
+      })
+    );
+
+    assert.throws(() => loadConfig(), /missing dataSourceId/);
   });
 
   it("configures ollama provider", () => {
@@ -253,8 +428,7 @@ describe("config", () => {
     assert.equal(config.kbAdapter, "json_v2");
     assert.equal(
       config.kbAdapterSourceUri,
-      pathToFileURL(path.join(process.env.HOME || "/tmp", ".pi", "knowledge-search", "index.json"))
-        .toString()
+      pathToFileURL(path.join(path.dirname(configFile), "knowledge-search", "index.json")).toString()
     );
   });
 

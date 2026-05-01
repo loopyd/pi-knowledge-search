@@ -1,10 +1,13 @@
 import { type ChildProcess, fork, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { join } from "node:path";
+import { getConfigPath } from "./config.js";
 import { StatusBar } from "./status-bar.js";
 import type {
   Config,
   ControllableIndex,
+  KnowledgeSearchProgressMessage,
+  RealtimeWatcher,
   StartOptions,
   SyncProgress,
   SyncWorkerResult,
@@ -25,6 +28,7 @@ export class SyncController {
   private activeWorker: ChildProcess | null = null;
   private currentConfig: Config | null = null;
   private index: ControllableIndex | null = null;
+  private realtime: RealtimeWatcher | null = null;
   private ctx: any;
   private statusBar = StatusBar.shared();
 
@@ -53,9 +57,11 @@ export class SyncController {
     const index = options.index;
     this.currentConfig = options.config;
     this.index = index;
+    this.realtime = options.realtime ?? null;
     this.ctx = options.ctx;
     this.statusBar.start(this.ctx, this.currentConfig);
-    index.setReindexState?.("running");
+    this.realtime?.stop();
+    index.reindex?.("running");
 
     await index.reset?.((progress: SyncProgress) => {
       this.statusBar.progress(progress);
@@ -67,12 +73,14 @@ export class SyncController {
   async pause(ctx?: any): Promise<void> {
     this.clearWorkerRestartTimer();
     this.workerExitExpected = true;
+    this.realtime?.stop();
     if (ctx) {
       this.ctx = ctx;
     }
 
     await this.stopActiveWorker("reindex_pause");
-    this.index?.setReindexState?.("paused");
+    this.index?.reindex?.("paused");
+    await this.index?.flush?.();
     this.statusBar.start(this.ctx, this.currentConfig);
     this.statusBar.pause(this.ctx, this.currentConfig);
     this.syncDone = true;
@@ -86,8 +94,10 @@ export class SyncController {
 
     this.currentConfig = options.config;
     this.index = options.index;
+    this.realtime = options.realtime ?? null;
     this.ctx = options.ctx;
     this.statusBar.start(this.ctx, this.currentConfig);
+    this.realtime?.stop();
 
     this.workerRestartCount = 0;
     this.workerRestartWindowStart = Date.now();
@@ -103,7 +113,7 @@ export class SyncController {
       return;
     }
 
-    if (respectPausedState && this.index.reindexState?.() === "paused") {
+    if (respectPausedState && this.index.reindex?.() === "paused") {
       this.statusBar.pause(this.ctx, this.currentConfig);
       this.syncDone = true;
       return;
@@ -118,6 +128,7 @@ export class SyncController {
       removed: 0,
     });
 
+    await this.index.flush?.();
     this.killStaleWorkerFromPidFile();
     this.spawn();
   }
@@ -126,9 +137,10 @@ export class SyncController {
     const wasRunning = !this.syncDone;
     this.clearWorkerRestartTimer();
     this.workerExitExpected = true;
+    this.realtime?.stop();
     await this.stopActiveWorker("session_shutdown");
     if (wasRunning) {
-      this.index?.setReindexState?.("paused");
+      this.index?.reindex?.("paused");
     }
     this.statusBar.clear();
     this.statusBar.stop();
@@ -312,14 +324,25 @@ export class SyncController {
   }
 
   private createWorker(workerPath: string): ChildProcess {
+    const env = { ...process.env };
+    if (this.currentConfig) {
+      env.KNOWLEDGE_SEARCH_RUNTIME_CONFIG = JSON.stringify(this.currentConfig);
+    }
+    try {
+      env.KNOWLEDGE_SEARCH_CONFIG = getConfigPath();
+    } catch {
+      // Fall back to the worker's own config discovery if the parent has no active config path.
+    }
+
     return fork(workerPath, [], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
-      env: { ...process.env },
+      env,
     });
   }
 
   private spawn(): void {
     this.killStaleWorkerFromPidFile();
+    this.realtime?.stop();
 
     const workerPath = join(import.meta.dirname, "..", "dist", "sync-worker.mjs");
     const worker = this.createWorker(workerPath);
@@ -337,10 +360,7 @@ export class SyncController {
     });
 
     worker.on("message", (message: unknown) => {
-      const payload = message as {
-        type?: string;
-        progress?: SyncProgress;
-      };
+      const payload = message as Partial<KnowledgeSearchProgressMessage>;
       if (payload?.type !== "knowledge-search-progress" || !payload.progress) {
         return;
       }
@@ -380,6 +400,7 @@ export class SyncController {
       const result = JSON.parse(stdout) as SyncWorkerResult;
       await this.index?.load();
       this.statusBar.result(result);
+      this.realtime?.start();
     } catch {
       // Ignore malformed worker output.
     }

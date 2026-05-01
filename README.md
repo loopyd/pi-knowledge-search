@@ -37,7 +37,7 @@ This walks you through:
 3. **Directories to exclude** (default: `node_modules, .git, .obsidian, .trash`)
 4. **Embedding provider** — OpenAI, OpenAI-compatible (local/self-hosted), AWS Bedrock, or Ollama
 
-Config is saved to `~/.pi/knowledge-search.json`. Run `/reload` to activate.
+Config is saved to the nearest project `.pi/knowledge-search.json` when a project `.pi/settings.json` or `.pi/knowledge-search.json` is present; otherwise it falls back to `~/.pi/knowledge-search.json`. Relative paths resolve from the active config directory. Run `/reload` to activate.
 
 ### Config file
 
@@ -136,10 +136,22 @@ The `apiKey` field is optional; omit it if your runner doesn't require authentic
 
 You can add [Amazon Bedrock Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html) as additional search sources. These are managed RAG services — Amazon handles chunking, embedding, and vector storage. pi-knowledge-search queries them at search time and merges results with local file results.
 
+Bedrock KB entries now support three modes:
+
+1. `search` — query an existing knowledge base only.
+2. `direct` — push local files into a Bedrock `custom` data source with the direct document APIs.
+3. `ingestion_job` — ask Bedrock to re-sync a staged data source such as S3 via `StartIngestionJob`.
+
 Add via command:
 
 ```
 /knowledge-add-kb
+```
+
+Inspect the saved Bedrock KB configuration:
+
+```
+/knowledge-bedrock-status
 ```
 
 Or add directly to the config file:
@@ -153,7 +165,48 @@ Or add directly to the config file:
       "id": "XXXXXXXXXX",
       "region": "us-east-1",
       "profile": "default",
-      "label": "Team docs"
+      "label": "Team docs",
+      "syncMode": "search"
+    }
+  ]
+}
+```
+
+To sync local files into a Bedrock custom data source:
+
+```json
+{
+  "dirs": ["~/notes"],
+  "knowledgeBases": [
+    {
+      "id": "KB12345678",
+      "label": "Team docs",
+      "profile": "my-work-profile",
+      "region": "us-east-1",
+      "dataSourceId": "DS12345678",
+      "dataSourceType": "custom",
+      "syncMode": "direct",
+      "ingestBatchSize": 25
+    }
+  ]
+}
+```
+
+To trigger a staged S3 sync job instead:
+
+```json
+{
+  "knowledgeBases": [
+    {
+      "id": "KB12345678",
+      "label": "Staged docs",
+      "profile": "my-work-profile",
+      "region": "us-east-1",
+      "dataSourceId": "DS12345678",
+      "dataSourceType": "s3",
+      "syncMode": "ingestion_job",
+      "pollIntervalMs": 2000,
+      "maxWaitMs": 300000
     }
   ]
 }
@@ -178,6 +231,8 @@ KB-only config:
 
 Requires the AWS SDK and valid credentials with `bedrock:Retrieve` permissions.
 
+For sync workflows, the same profile also needs the Bedrock knowledge-base document or ingestion-job permissions required by your selected mode. See [docs/bedrock-knowledge-bases.md](docs/bedrock-knowledge-bases.md) for mode details and AWS behavior notes.
+
 ### Environment variable overrides
 
 Every config field can be overridden via environment variables. This is useful for CI or when you want different settings per shell session. See [env-vars.md](docs/env-vars.md) for the full list.
@@ -195,9 +250,11 @@ The index is stored at `~/.pi/knowledge-search/index.json`.
 
 | Command                   | Description                                     |
 | ------------------------- | ----------------------------------------------- |
-| `/knowledge-search-setup` | Interactive setup wizard                        |
-| `/knowledge-add-kb`       | Add a Bedrock Knowledge Base as a search source |
-| `/knowledge-reindex`      | Force a full re-index                           |
+| `/knowledge-search-setup`  | Interactive setup wizard                        |
+| `/knowledge-add-kb`        | Add a Bedrock Knowledge Base as a search source |
+| `/knowledge-bedrock-status`| Show the current Bedrock KB configuration       |
+| `/knowledge-bedrock-sync`  | Sync configured Bedrock KB data sources         |
+| `/knowledge-reindex`       | Force a full re-index                           |
 
 ## Performance
 

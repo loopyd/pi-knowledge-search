@@ -1,18 +1,21 @@
+/* SQLite-backed adapter implemented through Drizzle and a hand-authored migration. */
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { AdapterBase, INDEX_VERSION } from "./base.js";
-import type { AdapterSourceDescriptor } from "./base.js";
-import type { IndexAdapter, IndexData, SqliteStore } from "../types.js";
+import type { AdapterSourceDescriptor, IndexAdapter, IndexData, SqliteStore } from "../types.js";
 
+/* Key/value metadata table describing the current logical index state. */
 const metaTable = sqliteTable("kb_meta", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),
 });
 
+/* Entry table holding one normalized chunk record per indexed chunk. */
 const entryTable = sqliteTable("kb_entries", {
   key: text("key").primaryKey(),
   absPath: text("abs_path").notNull(),
@@ -25,6 +28,7 @@ const entryTable = sqliteTable("kb_entries", {
   chunkIndex: integer("chunk_index").notNull(),
 });
 
+/* Drizzle schema bundle passed to the driver and the migrator. */
 const schema = {
   metaTable,
   entryTable,
@@ -36,14 +40,48 @@ const META_VERSION = "version";
 const META_DIMENSIONS = "dimensions";
 const META_REINDEX = "reindexState";
 const INSERT_BATCH = 200;
-const MIGRATIONS_FOLDER = fileURLToPath(new URL("../../drizzle", import.meta.url));
 const MIGRATIONS_TABLE = "kb_drizzle_migrations";
 
+function resolveMigrationsFolder(metaUrl: string): string {
+  const candidates = [
+    fileURLToPath(new URL("../../drizzle", metaUrl)),
+    fileURLToPath(new URL("../drizzle", metaUrl)),
+  ];
+
+  const resolved = candidates.find((candidate) =>
+    fs.existsSync(path.join(candidate, "meta", "_journal.json"))
+  );
+
+  return resolved ?? candidates[0];
+}
+
+const MIGRATIONS_FOLDER = resolveMigrationsFolder(import.meta.url);
+
+/**
+ * SQLite adapter for the current v4 logical index model.
+ *
+ * This adapter exposes the same IndexAdapter interface as the JSON formats, but
+ * persists rows through Drizzle so the rest of the runtime can switch storage
+ * backends without caring about SQL details.
+ */
 export class SqliteV4Adapter extends AdapterBase<IndexData, SqliteStore<SqliteSchema>> {
+  /**
+   * Wrap a SQLite source path or a descriptor inherited from a migration chain.
+   *
+   * Descriptors let legacy fallbacks and the SQLite target stay anchored to the
+   * same logical configured source while still choosing their own file names.
+   */
   constructor(source: string | AdapterSourceDescriptor, dimensions: number) {
     super(source, dimensions, "index.sqlite", "sqlite_local", INDEX_VERSION);
   }
 
+  /**
+   * Open the SQLite database and ensure its schema is available.
+   *
+   * This doubles as the adapter's constructor-time resource initializer. The
+   * Drizzle migrator keeps schema bootstrap hand-authored while still routing all
+   * runtime data access through the ORM surface.
+   */
   override async open(): Promise<SqliteStore<SqliteSchema>> {
     if (this.client) {
       return this.client;
@@ -58,11 +96,18 @@ export class SqliteV4Adapter extends AdapterBase<IndexData, SqliteStore<SqliteSc
     return this.bind({ client, orm });
   }
 
+  /**
+   * Close the active SQLite handle.
+   *
+   * This is the adapter's destructor-equivalent cleanup hook and is safe to call
+   * repeatedly because the cached client is cleared after closing.
+   */
   override async close(): Promise<void> {
     this.client?.client.close();
     this.client = undefined;
   }
 
+  /* Read metadata first, then hydrate entries row-by-row into the normalized index shape. */
   async read(): Promise<IndexData | null> {
     if (!this.exists()) return null;
 
@@ -104,6 +149,7 @@ export class SqliteV4Adapter extends AdapterBase<IndexData, SqliteStore<SqliteSc
     }
   }
 
+  /* Rewrite the SQLite index inside one Drizzle transaction so callers see one coherent snapshot. */
   async write(data: IndexData): Promise<void> {
     const store = await this.open();
     const entries = Object.entries(data.entries);
@@ -138,14 +184,14 @@ export class SqliteV4Adapter extends AdapterBase<IndexData, SqliteStore<SqliteSc
     });
   }
 
-  override canMigrateFrom<TAdapter extends IndexAdapter<IndexData, unknown>>(adapter: TAdapter): boolean {
+  override accepts<TAdapter extends IndexAdapter<IndexData, unknown>>(adapter: TAdapter): boolean {
     return (
-      super.canMigrateFrom(adapter) ||
+      super.accepts(adapter) ||
       (adapter.kind() === "jsonl_v4" && adapter.version() === INDEX_VERSION)
     );
   }
 
-  override async migrateFrom<TAdapter extends IndexAdapter<IndexData, unknown>>(
+  override async migrate<TAdapter extends IndexAdapter<IndexData, unknown>>(
     adapter: TAdapter,
     data: IndexData
   ): Promise<IndexData> {
@@ -153,9 +199,15 @@ export class SqliteV4Adapter extends AdapterBase<IndexData, SqliteStore<SqliteSc
       return this.migrated(data, INDEX_VERSION);
     }
 
-    return await super.migrateFrom(adapter, data);
+    return await super.migrate(adapter, data);
   }
 
+  /**
+   * Delete the SQLite database after releasing any open handle.
+   *
+   * This is the destructive cleanup path used by migration chains and explicit
+   * adapter deletion requests.
+   */
   override async delete(): Promise<void> {
     await this.close();
     if (!this.exists()) {
@@ -164,6 +216,7 @@ export class SqliteV4Adapter extends AdapterBase<IndexData, SqliteStore<SqliteSc
     await fs.promises.rm(this.path(), { force: true });
   }
 
+  /* Strip the chunk suffix from an entry key so SQLite can store the owning file path explicitly. */
   private abs(key: string): string {
     const hash = key.lastIndexOf("#");
     return hash >= 0 ? key.slice(0, hash) : key;

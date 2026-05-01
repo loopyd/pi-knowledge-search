@@ -30,7 +30,7 @@ describe("JsonV3Adapter", () => {
 
   it("migrates forward from v2 content", async () => {
     const adapter = new JsonV3Adapter(`${tmpDir}/custom-v3.store`, 4);
-    const migrated = await adapter.migrateFrom(new JsonV2Adapter(`${tmpDir}/legacy.store`, 4), {
+    const migrated = await adapter.migrate(new JsonV2Adapter(`${tmpDir}/legacy.store`, 4), {
       ...makeIndexData(),
       version: 2,
     });

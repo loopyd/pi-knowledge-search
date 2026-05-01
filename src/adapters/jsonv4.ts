@@ -1,14 +1,27 @@
 import * as fs from "node:fs";
 import * as readline from "node:readline";
 import { AdapterBase, INDEX_VERSION, LEGACY_JSON_VERSION } from "./base.js";
-import type { AdapterSourceDescriptor } from "./base.js";
-import type { IndexAdapter, IndexData, JsonlLine } from "../types.js";
+import type { AdapterSourceDescriptor, IndexAdapter, IndexData, JsonlLine } from "../types.js";
 
+/**
+ * Adapter for the current JSONL v4 storage format.
+ *
+ * v4 stores a small metadata record followed by per-entry lines, which makes it
+ * naturally stream-friendly and lets the main runtime treat the index as an
+ * append-friendly, migration-safe structured log.
+ */
 export class JsonV4Adapter extends AdapterBase<IndexData> {
+  /**
+   * Wrap a JSONL v4 source or a source descriptor inherited from a chain adapter.
+   *
+   * The descriptor form keeps migration paths anchored to the same logical index
+   * even when probing older sibling files.
+   */
   constructor(source: string | AdapterSourceDescriptor, dimensions: number) {
     super(source, dimensions, "index.jsonl", "jsonl_v4", INDEX_VERSION);
   }
 
+  /* Read the JSONL index line-by-line so large current indexes never require one giant string. */
   async read(): Promise<IndexData | null> {
     if (!this.exists()) return null;
 
@@ -45,6 +58,7 @@ export class JsonV4Adapter extends AdapterBase<IndexData> {
     return ready ? data : null;
   }
 
+  /* Write v4 as one metadata line plus sorted entry lines for deterministic output. */
   async write(data: IndexData): Promise<void> {
     await this.atomic(async (tmp) => {
       let fd: number | null = null;
@@ -88,14 +102,14 @@ export class JsonV4Adapter extends AdapterBase<IndexData> {
     });
   }
 
-  override canMigrateFrom<TAdapter extends IndexAdapter<IndexData, unknown>>(adapter: TAdapter): boolean {
+  override accepts<TAdapter extends IndexAdapter<IndexData, unknown>>(adapter: TAdapter): boolean {
     return (
-      super.canMigrateFrom(adapter) ||
+      super.accepts(adapter) ||
       (adapter.kind() === "json_v3" && adapter.version() === LEGACY_JSON_VERSION)
     );
   }
 
-  override async migrateFrom<TAdapter extends IndexAdapter<IndexData, unknown>>(
+  override async migrate<TAdapter extends IndexAdapter<IndexData, unknown>>(
     adapter: TAdapter,
     data: IndexData
   ): Promise<IndexData> {
@@ -103,9 +117,10 @@ export class JsonV4Adapter extends AdapterBase<IndexData> {
       return this.migrated(data, INDEX_VERSION);
     }
 
-    return await super.migrateFrom(adapter, data);
+    return await super.migrate(adapter, data);
   }
 
+  /* Ignore malformed lines and only hydrate rows that match the JSONL contract. */
   private parse(line: string): Partial<JsonlLine> | null {
     const text = line.trim();
     if (text.length === 0) return null;
