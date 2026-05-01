@@ -16,34 +16,14 @@
 import remarkFrontmatter from "remark-frontmatter";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
+import type { Chunk, OffsetRange, Section } from "./types.js";
 
-export interface Chunk {
-  /** The chunk text content */
-  text: string;
-  /** The heading this chunk falls under ("intro" for content before first heading) */
-  heading: string;
-  /** Line number where this chunk starts (0-indexed) */
-  startLine: number;
-  /** Character offset in original content */
-  charOffset: number;
-}
+export type { Chunk } from "./types.js";
 
 /** Shared markdown parser configured to recognise YAML/TOML frontmatter blocks
  *  so that their closing `---` / `+++` fences aren't misread as setext heading
  *  underlines for the preceding line. */
 const markdownProcessor = unified().use(remarkParse).use(remarkFrontmatter, ["yaml", "toml"]);
-
-interface Section {
-  text: string;
-  heading: string;
-  startLine: number;
-  charOffset: number;
-}
-
-interface OffsetRange {
-  start: number;
-  end: number;
-}
 
 const LARGE_FILE_FAST_PATH_CHARS = 120_000;
 

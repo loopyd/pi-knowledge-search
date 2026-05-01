@@ -1,17 +1,7 @@
-import type { ProviderConfig } from "./config.js";
+import type { Embedder, ProviderConfig } from "./types.js";
+import { createBedrockRuntimeClient } from "./bedrock.js";
 
-/**
- * Unified embedding interface. Implementations for OpenAI, OpenAI-compatible,
- * Bedrock, and Ollama.
- */
-export interface Embedder {
-  embed(text: string, signal?: AbortSignal): Promise<number[]>;
-  embedBatch(
-    texts: string[],
-    signal?: AbortSignal,
-    concurrency?: number
-  ): Promise<(number[] | null)[]>;
-}
+export type { Embedder } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -183,14 +173,7 @@ class BedrockEmbedder implements Embedder {
     this.dimensions = dimensions;
 
     // Lazy-load the AWS SDK — it's an optional dependency
-    this.clientPromise = (async () => {
-      const { BedrockRuntimeClient } = await import("@aws-sdk/client-bedrock-runtime");
-      const { fromIni } = await import("@aws-sdk/credential-providers");
-      return new BedrockRuntimeClient({
-        region,
-        credentials: fromIni({ profile }),
-      });
-    })();
+    this.clientPromise = createBedrockRuntimeClient(profile, region);
   }
 
   async embed(text: string, signal?: AbortSignal): Promise<number[]> {

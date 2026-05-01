@@ -24,7 +24,14 @@ const index = new KnowledgeIndex(config, embedder);
 await index.load();
 
 index
-  .sync()
+  .sync((progress) => {
+    if (typeof process.send === "function") {
+      process.send({
+        type: "knowledge-search-progress",
+        progress,
+      });
+    }
+  })
   .then(({ added, updated, removed }) => {
     const result = JSON.stringify({
       added,

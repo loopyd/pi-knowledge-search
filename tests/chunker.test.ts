@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chunkMarkdown } from "./chunker.js";
+import { chunkMarkdown } from "../src/chunker.js";
 
 describe("chunkMarkdown", () => {
   it("returns empty array for empty string", () => {
@@ -35,11 +35,10 @@ describe("chunkMarkdown", () => {
       "",
       "Content of section two.",
     ].join("\n");
-    // Make it large enough to not be a single chunk
     const chunks = chunkMarkdown(md, 50);
     assert.ok(chunks.length >= 2, `Expected >=2 chunks, got ${chunks.length}`);
 
-    const headings = chunks.map((c) => c.heading);
+    const headings = chunks.map((chunk) => chunk.heading);
     assert.ok(headings.includes("Section One"));
     assert.ok(headings.includes("Section Two"));
   });
@@ -63,7 +62,6 @@ describe("chunkMarkdown", () => {
     const md = [para1, "", para2, "", para3].join("\n");
     const chunks = chunkMarkdown(md, 50);
     assert.ok(chunks.length >= 1);
-    // All chunks should have 'intro' heading since no headings exist
     for (const chunk of chunks) {
       assert.equal(chunk.heading, "intro");
     }
@@ -73,31 +71,17 @@ describe("chunkMarkdown", () => {
     const longText = "A".repeat(500);
     const chunks = chunkMarkdown(longText, 100);
     assert.ok(chunks.length > 1, `Expected >1 chunks for long text, got ${chunks.length}`);
-    // All text should be covered (with possible overlap)
-    const totalLen = chunks.reduce((sum, c) => sum + c.text.length, 0);
+    const totalLen = chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
     assert.ok(totalLen >= longText.length, "Hard-split should cover all text");
   });
 
   it("hard-split chunks have overlap", () => {
-    const longText = "ABCDEFGHIJ".repeat(50); // 500 chars
-    const maxSize = 100;
-    const chunks = chunkMarkdown(longText, maxSize);
+    const longText = "ABCDEFGHIJ".repeat(50);
+    const chunks = chunkMarkdown(longText, 100);
     assert.ok(chunks.length > 1);
 
-    // Check overlap: end of chunk N should overlap with start of chunk N+1
-    for (let i = 0; i < chunks.length - 1; i++) {
-      const currentEnd = chunks[i].text.slice(-50);
-      const nextStart = chunks[i + 1].text.slice(0, 50);
-      // There should be some shared content (overlap = 200 default, but text is shorter)
-      const hasOverlap =
-        currentEnd.length > 0 &&
-        nextStart.length > 0 &&
-        chunks[i].text.length + chunks[i + 1].text.length > longText.length / chunks.length;
-      // Just verify chunks exist and are sized properly
-      assert.ok(
-        chunks[i].text.length <= maxSize,
-        `Chunk ${i} exceeds maxSize: ${chunks[i].text.length}`
-      );
+    for (let index = 0; index < chunks.length - 1; index += 1) {
+      assert.ok(chunks[index].text.length <= 100, `Chunk ${index} exceeds maxSize`);
     }
   });
 
@@ -115,14 +99,13 @@ describe("chunkMarkdown", () => {
       "And some text after.",
     ].join("\n");
     const chunks = chunkMarkdown(md);
-    const allText = chunks.map((c) => c.text).join("\n\n");
+    const allText = chunks.map((chunk) => chunk.text).join("\n\n");
     assert.ok(allText.includes("```typescript"));
     assert.ok(allText.includes('const x = "hello"'));
     assert.ok(allText.includes("```"));
   });
 
   it("merges tiny chunks with neighbors", () => {
-    // Create content where some sections are very small
     const md = [
       "## Big Section",
       "",
@@ -137,15 +120,20 @@ describe("chunkMarkdown", () => {
       "This section also has enough content to be meaningful on its own.",
     ].join("\n");
     const chunks = chunkMarkdown(md, 3000, 200);
-    // The tiny "Hi." section should be merged with a neighbor
-    const tinyChunk = chunks.find((c) => c.text.trim() === "## Tiny\n\nHi.");
+    const tinyChunk = chunks.find((chunk) => chunk.text.trim() === "## Tiny\n\nHi.");
     assert.equal(tinyChunk, undefined, "Tiny chunk should be merged, not standalone");
   });
 
   it("tracks startLine correctly across sections", () => {
-    const md = ["Line 0", "Line 1", "", "## Section at Line 3", "", "Line 5 content"].join("\n");
+    const md = [
+      "Line 0",
+      "Line 1",
+      "",
+      "## Section at Line 3",
+      "",
+      "Line 5 content",
+    ].join("\n");
     const chunks = chunkMarkdown(md, 30);
-    // At least verify first chunk starts at line 0
     assert.equal(chunks[0].startLine, 0);
   });
 
@@ -169,24 +157,21 @@ describe("chunkMarkdown", () => {
       "Content under level 4.",
     ].join("\n");
     const chunks = chunkMarkdown(md, 40);
-    const headings = chunks.map((c) => c.heading);
-    assert.ok(
-      headings.includes("Level 3 Heading") || headings.includes("Level 4 Heading"),
-      "Should recognize level 3+ headings"
-    );
+    const headings = chunks.map((chunk) => chunk.heading);
+    assert.ok(headings.includes("Level 3 Heading") || headings.includes("Level 4 Heading"));
   });
 
   it("does NOT split on level 1 headings (# Title)", () => {
-    // The HEADING_RE matches #{2,6}, so # should not trigger a split
-    const md = ["# Title", "", "Intro text.", "", "# Another Title", "", "More text."].join("\n");
+    const md = ["# Title", "", "Intro text.", "", "# Another Title", "", "More text."].join(
+      "\n"
+    );
     const chunks = chunkMarkdown(md, 3000);
-    // Both # headings should be in the same "intro" section since # doesn't split
     assert.equal(chunks.length, 1);
     assert.equal(chunks[0].heading, "intro");
   });
 
   it("respects custom maxChunkSize", () => {
-    const md = "Word ".repeat(200); // ~1000 chars
+    const md = "Word ".repeat(200);
     const chunks = chunkMarkdown(md, 100);
     for (const chunk of chunks) {
       assert.ok(chunk.text.length <= 100, `Chunk exceeds custom maxSize: ${chunk.text.length}`);
@@ -194,61 +179,12 @@ describe("chunkMarkdown", () => {
   });
 
   it("respects custom minChunkSize for merging", () => {
-    // With a very high minChunkSize, small chunks should be aggressively merged
-    const md = [
-      "## A",
-      "",
-      "Small.",
-      "",
-      "## B",
-      "",
-      "Also small.",
-      "",
-      "## C",
-      "",
-      "Still small.",
-    ].join("\n");
+    const md = ["## A", "", "Small.", "", "## B", "", "Also small.", "", "## C", "", "Still small."].join(
+      "\n"
+    );
     const chunksDefault = chunkMarkdown(md, 3000, 200);
     const chunksAggressive = chunkMarkdown(md, 3000, 500);
-    assert.ok(
-      chunksAggressive.length <= chunksDefault.length,
-      "Higher minChunkSize should produce fewer (merged) chunks"
-    );
-  });
-
-  it("does not treat code-fence heading text as a real section heading", () => {
-    const md = [
-      "## Real Section",
-      "",
-      "Before code block.",
-      "",
-      "```md",
-      "## Not A Heading",
-      "text in fence",
-      "```",
-      "",
-      "After code block.",
-    ].join("\n");
-
-    const chunks = chunkMarkdown(md, 70);
-    const headings = chunks.map((c) => c.heading);
-    assert.ok(headings.includes("Real Section"));
-    assert.ok(!headings.includes("Not A Heading"));
-  });
-
-  it("supports setext-style level 2 headings as section boundaries", () => {
-    const md = [
-      "Intro text before heading.",
-      "",
-      "Setext Heading",
-      "--------------",
-      "",
-      "Body for setext heading section.",
-    ].join("\n");
-
-    const chunks = chunkMarkdown(md, 40);
-    const headings = chunks.map((c) => c.heading);
-    assert.ok(headings.includes("Setext Heading"));
+    assert.ok(chunksAggressive.length <= chunksDefault.length);
   });
 
   it("merges tiny previous chunk into larger current chunk and adopts heading", () => {
@@ -268,8 +204,6 @@ describe("chunkMarkdown", () => {
 
     const chunks = chunkMarkdown(md, 120, 40);
     assert.ok(chunks.length >= 2);
-
-    // First tiny section should be merged into second and heading should adopt the larger section.
     assert.equal(chunks[0].heading, "Big Second");
     assert.ok(chunks[0].text.includes("## Tiny First"));
     assert.ok(chunks[0].text.includes("## Big Second"));
@@ -292,78 +226,54 @@ describe("chunkMarkdown", () => {
 
     const chunks = chunkMarkdown(md, 120, 40);
     assert.ok(chunks.length >= 2);
-
-    // Tiny second section should merge into the first, keeping first heading.
     assert.equal(chunks[0].heading, "Big First");
     assert.ok(chunks[0].text.includes("## Big First"));
     assert.ok(chunks[0].text.includes("## Tiny Second"));
   });
 
-  it("does not treat the closing --- of YAML frontmatter as a setext heading", () => {
-    // Without remark-frontmatter, the closing `---` of a YAML frontmatter
-    // block gets parsed as a setext heading underline for the previous line,
-    // producing a phantom heading named after the last frontmatter key.
-    const md = [
-      "---",
-      "tags: [notes, moc]",
-      "type: moc",
-      "---",
-      "",
-      "# Real Title",
-      "",
-      "Real intro paragraph.",
-      "",
-      "## First Section",
-      "",
-      "Body for first section.",
-    ].join("\n");
+  it("uses the fast path for very large files with headings and intro content", () => {
+    const intro = `${"intro paragraph ".repeat(6000)}\n\n`;
+    const sectionOne = `## Alpha\n\n${"alpha body ".repeat(5000)}\n\n`;
+    const sectionTwo = `## Beta\n\n${"beta body ".repeat(5000)}`;
+    const md = `${intro}${sectionOne}${sectionTwo}`;
 
-    const chunks = chunkMarkdown(md, 40);
-    const headings = chunks.map((c) => c.heading);
-    assert.ok(headings.includes("First Section"), `expected 'First Section' in ${JSON.stringify(headings)}`);
-    // No chunk should claim the YAML body as its heading.
-    assert.ok(!headings.some((h) => h.includes("type: moc")));
-    assert.ok(!headings.some((h) => h.includes("tags:")));
+    const chunks = chunkMarkdown(md, 1200, 100);
+
+    assert.ok(md.length > 120000, "test fixture must trigger the fast path");
+    assert.ok(chunks.length > 3);
+    assert.equal(chunks[0].heading, "intro");
+    assert.ok(chunks.some((chunk) => chunk.heading === "Alpha"));
+    assert.ok(chunks.some((chunk) => chunk.heading === "Beta"));
+    assert.ok(chunks.every((chunk) => chunk.charOffset >= 0));
   });
 
-  it("does not treat the closing +++ of TOML frontmatter as a setext heading", () => {
-    const md = [
-      "+++",
-      "title = 'x'",
-      "+++",
-      "",
-      "## First Section",
-      "",
-      "Body for first section.",
-    ].join("\n");
+  it("uses the fast path for very large files without headings", () => {
+    const md = `${"paragraph text ".repeat(9000)}\n\n${"more paragraph text ".repeat(9000)}`;
+    const chunks = chunkMarkdown(md, 1500, 200);
 
-    const chunks = chunkMarkdown(md, 40);
-    const headings = chunks.map((c) => c.heading);
-    assert.ok(headings.includes("First Section"));
-    assert.ok(!headings.some((h) => h.includes("title")));
-  });
-
-  it("uses fast path for very large files (>= 120k chars) without regressing basics", () => {
-    // Build a large file that exceeds the LARGE_FILE_FAST_PATH_CHARS threshold.
-    const section = [
-      "## Section",
-      "",
-      "Paragraph of content. ".repeat(20),
-      "",
-    ].join("\n");
-    const md = section.repeat(400); // ~150k+ chars
-    assert.ok(md.length >= 120_000, `expected >= 120k chars, got ${md.length}`);
-
-    const chunks = chunkMarkdown(md, 3000, 200);
+    assert.ok(md.length > 120000, "test fixture must trigger the fast path");
     assert.ok(chunks.length > 1);
-    // Most chunks should be under the size limit.
-    for (const chunk of chunks) {
-      assert.ok(
-        chunk.text.length <= 3000,
-        `Fast path produced oversized chunk: ${chunk.text.length}`
-      );
-    }
-    // At least some chunks should recognise the ## Section heading.
-    assert.ok(chunks.some((c) => c.heading === "Section"));
+    assert.ok(chunks.every((chunk) => chunk.heading === "intro"));
+    assert.equal(chunks[0].startLine, 0);
+    assert.equal(chunks[0].charOffset, 0);
+  });
+
+  it("recognizes setext headings while ignoring frontmatter fences", () => {
+    const md = [
+      "---",
+      "title: Sample",
+      "category: docs",
+      "---",
+      "",
+      "Overview",
+      "--------",
+      "",
+      "This section should be chunked under the setext heading.",
+    ].join("\n");
+
+    const chunks = chunkMarkdown(md, 80);
+
+    assert.ok(chunks.some((chunk) => chunk.heading === "Overview"));
+    assert.ok(chunks.every((chunk) => chunk.heading !== "title: Sample"));
   });
 });

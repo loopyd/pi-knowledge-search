@@ -1,15 +1,7 @@
-import type { SearchResult } from "./index-store.js";
+import type { KnowledgeBaseConfig, SearchResult } from "./types.js";
+import { createBedrockAgentRuntimeClient, normalizeBedrockResultLocation } from "./bedrock.js";
 
-export interface KnowledgeBaseConfig {
-  /** Bedrock Knowledge Base ID */
-  id: string;
-  /** AWS region (default: us-east-1) */
-  region?: string;
-  /** AWS profile (default: "default") */
-  profile?: string;
-  /** Human-readable label for display */
-  label?: string;
-}
+export type { KnowledgeBaseConfig } from "./types.js";
 
 /**
  * Searches one or more Bedrock Knowledge Bases and returns results
@@ -18,6 +10,7 @@ export interface KnowledgeBaseConfig {
 export class BedrockKBSearcher {
   private configs: KnowledgeBaseConfig[];
   private clients: Map<string, { client: any; config: KnowledgeBaseConfig }> = new Map();
+  private sharedClients: Map<string, any> = new Map();
   private initPromise: Promise<void> | null = null;
 
   constructor(configs: KnowledgeBaseConfig[]) {
@@ -32,32 +25,17 @@ export class BedrockKBSearcher {
 
   private async _init(): Promise<void> {
     try {
-      const { BedrockAgentRuntimeClient } = await import("@aws-sdk/client-bedrock-agent-runtime");
-      const { fromIni } = await import("@aws-sdk/credential-providers");
-
       for (const config of this.configs) {
         const region = config.region || "us-east-1";
         const profile = config.profile || "default";
-        // Reuse clients for same region+profile
-        const cacheKey = `${region}:${profile}`;
+        const cacheKey = `${region}:${profile === "default" ? "default-chain" : profile}`;
         if (!this.clients.has(config.id)) {
-          const existing = [...this.clients.values()].find(
-            (c) =>
-              (c.config.region || "us-east-1") === region &&
-              (c.config.profile || "default") === profile
-          );
-          if (existing) {
-            this.clients.set(config.id, {
-              client: existing.client,
-              config,
-            });
-          } else {
-            const client = new BedrockAgentRuntimeClient({
-              region,
-              credentials: fromIni({ profile }),
-            });
-            this.clients.set(config.id, { client, config });
+          let client = this.sharedClients.get(cacheKey);
+          if (!client) {
+            client = await createBedrockAgentRuntimeClient(profile, region);
+            this.sharedClients.set(cacheKey, client);
           }
+          this.clients.set(config.id, { client, config });
         }
       }
     } catch (err: any) {
@@ -97,13 +75,7 @@ export class BedrockKBSearcher {
           // Bedrock scores are 0-1 relevance, same range as our cosine similarity
           if (score < 0.15) continue;
 
-          const uri =
-            result.location?.s3Location?.uri ??
-            result.location?.webLocation?.url ??
-            result.location?.confluenceLocation?.url ??
-            result.location?.salesforceLocation?.url ??
-            result.location?.sharePointLocation?.url ??
-            "unknown";
+          const uri = normalizeBedrockResultLocation(result.location);
 
           const label = config.label ? ` [${config.label}]` : " [KB]";
 

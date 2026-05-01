@@ -10,7 +10,7 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    files: ["src/**/*.ts"],
+    files: ["src/**/*.ts", "tests/**/*.ts"],
     languageOptions: {
       globals: {
         ...globals.node,
@@ -36,7 +36,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["src/**/*.test.ts"],
+    files: ["src/**/*.test.ts", "tests/**/*.test.ts"],
     rules: {
       "no-empty": "off",
       "@typescript-eslint/no-explicit-any": "off",

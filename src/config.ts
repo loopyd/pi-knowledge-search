@@ -1,43 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { KnowledgeBaseConfig } from "./kb-searcher.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import type { Config, ConfigFile, KbAdapter, KbAdapterInput, ProviderConfig } from "./types.js";
 
-export interface Config {
-  /** Directories to index */
-  dirs: string[];
-  /** File extensions to index (with dots) */
-  fileExtensions: string[];
-  /** Directory names to skip */
-  excludeDirs: string[];
-  /** Embedding dimensions */
-  dimensions: number;
-  /** Embedding provider config (required for local file indexing) */
-  provider: ProviderConfig | null;
-  /** Where to store the index */
-  indexDir: string;
-  /** Optional Bedrock Knowledge Bases to search */
-  knowledgeBases: KnowledgeBaseConfig[];
-}
-
-export type ProviderConfig =
-  | { type: "openai"; apiKey: string; model: string }
-  | { type: "openai-compatible"; apiKey?: string; model: string; baseUrl: string }
-  | { type: "bedrock"; profile: string; region: string; model: string }
-  | { type: "ollama"; url: string; model: string };
-
-/** Raw shape stored in the config file. */
-export interface ConfigFile {
-  dirs?: string[];
-  fileExtensions?: string[];
-  excludeDirs?: string[];
-  dimensions?: number;
-  knowledgeBases?: KnowledgeBaseConfig[];
-  provider?:
-    | { type: "openai"; apiKey?: string; model?: string }
-    | { type: "openai-compatible"; apiKey?: string; model?: string; baseUrl?: string }
-    | { type: "bedrock"; profile?: string; region?: string; model?: string }
-    | { type: "ollama"; url?: string; model?: string };
-}
+export type { Config, ConfigFile, KbAdapter, ProviderConfig } from "./types.js";
 
 const CONFIG_PATH =
   process.env.KNOWLEDGE_SEARCH_CONFIG ||
@@ -64,8 +30,11 @@ export function loadConfig(): Config | null {
 
   // Check env var fallback for dirs
   const envDirs = process.env.KNOWLEDGE_SEARCH_DIRS;
+  const envAdapterSourceUri =
+    envStr("KB_ADAPTER_SOURCE_URI") ?? envStr("KNOWLEDGE_SEARCH_KB_ADAPTER_SOURCE_URI");
 
   const hasKBs = (file?.knowledgeBases?.length ?? 0) > 0;
+  const hasAdapterSource = Boolean(envAdapterSourceUri ?? file?.kbAdapterSourceUri);
 
   if (!file && !envDirs) {
     return null; // Not configured yet
@@ -79,7 +48,7 @@ export function loadConfig(): Config | null {
     .map(resolvePath)
     .filter(Boolean);
 
-  if (dirs.length === 0 && !hasKBs) return null;
+  if (dirs.length === 0 && !hasKBs && !hasAdapterSource) return null;
 
   const fileExtensions = envStr("KNOWLEDGE_SEARCH_EXTENSIONS")
     ?.split(",")
@@ -92,6 +61,17 @@ export function loadConfig(): Config | null {
     file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
 
   const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ?? file?.dimensions ?? 512;
+  const kbAdapter = normalizeKbAdapter(
+    kbAdapterInput(envStr("KB_ADAPTER") ?? envStr("KNOWLEDGE_SEARCH_KB_ADAPTER") ?? file?.kbAdapter)
+  );
+  const defaultIndexDir =
+    envStr("KNOWLEDGE_SEARCH_INDEX_DIR") ?? path.join(home, ".pi", "knowledge-search");
+  const kbAdapterSourceUri = normalizeKbAdapterSourceUri(
+    envAdapterSourceUri ?? file?.kbAdapterSourceUri,
+    kbAdapter,
+    defaultIndexDir,
+    home
+  );
 
   const providerType =
     envStr("KNOWLEDGE_SEARCH_PROVIDER") ??
@@ -195,8 +175,7 @@ export function loadConfig(): Config | null {
     }
   } // end if (providerType)
 
-  const indexDir =
-    envStr("KNOWLEDGE_SEARCH_INDEX_DIR") ?? path.join(home, ".pi", "knowledge-search");
+  const indexDir = adapterDirectoryFromSourceUri(kbAdapterSourceUri);
 
   return {
     dirs,
@@ -205,6 +184,8 @@ export function loadConfig(): Config | null {
     dimensions,
     provider,
     indexDir,
+    kbAdapter,
+    kbAdapterSourceUri,
     knowledgeBases: file?.knowledgeBases ?? [],
   };
 }
@@ -226,4 +207,72 @@ function envStr(key: string): string | undefined {
 function envInt(key: string): number | undefined {
   const v = envStr(key);
   return v ? parseInt(v, 10) : undefined;
+}
+
+function normalizeKbAdapter(value?: KbAdapterInput): KbAdapter {
+  switch (value) {
+    case "json_v2":
+      return "json_v2";
+    case "jsonl_v3":
+    case "json_v3":
+      return "json_v3";
+    case "sqlite_local":
+      return "sqlite_local";
+    case "jsonl_v4":
+    default:
+      return "jsonl_v4";
+  }
+}
+
+function kbAdapterInput(value?: string): KbAdapterInput | undefined {
+  switch (value) {
+    case "json_v2":
+    case "json_v3":
+    case "jsonl_v3":
+    case "jsonl_v4":
+    case "sqlite_local":
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+function kbAdapterFilename(adapter: KbAdapter): string {
+  switch (adapter) {
+    case "json_v2":
+    case "json_v3":
+      return "index.json";
+    case "sqlite_local":
+      return "index.sqlite";
+    case "jsonl_v4":
+    default:
+      return "index.jsonl";
+  }
+}
+
+function normalizeKbAdapterSourceUri(
+  value: string | undefined,
+  adapter: KbAdapter,
+  defaultIndexDir: string,
+  home: string
+): string {
+  const fallbackPath = path.join(defaultIndexDir, kbAdapterFilename(adapter));
+  const localPath = value ? resolveLocalPath(value, home) : fallbackPath;
+  return pathToFileURL(localPath).toString();
+}
+
+function adapterDirectoryFromSourceUri(uri: string): string {
+  if (!uri.startsWith("file:")) {
+    throw new Error(`Local adapter source URI must use the file: scheme. Received: ${uri}`);
+  }
+
+  return path.dirname(fileURLToPath(uri));
+}
+
+function resolveLocalPath(value: string, home: string): string {
+  if (value.startsWith("file:")) {
+    return fileURLToPath(value);
+  }
+
+  return path.resolve(value.replace(/^~/, home));
 }

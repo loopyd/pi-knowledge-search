@@ -1,25 +1,26 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { fork } from "node:child_process";
 import * as fs from "node:fs";
-import { join } from "node:path";
-import { loadConfig, saveConfig, getConfigPath, type Config, type ConfigFile } from "./config.js";
+import { loadConfig, saveConfig, getConfigPath } from "./config.js";
 import { createEmbedder } from "./embedder.js";
 import { KnowledgeIndex } from "./index-store.js";
 import { BedrockKBSearcher } from "./kb-searcher.js";
+import { SyncController } from "./sync-controller.js";
+import type { Config, ConfigFile } from "./types.js";
 
 export default function (pi: ExtensionAPI) {
   let index: KnowledgeIndex | null = null;
   let kbSearcher: BedrockKBSearcher | null = null;
   let currentConfig: Config | null = null;
-  let syncDone = false;
-  let workerExitExpected = false;
+  const syncController = SyncController.shared();
 
   // ------------------------------------------------------------------
   // Lifecycle
   // ------------------------------------------------------------------
 
   pi.on("session_start", async (_event, ctx) => {
+    index = null;
+    kbSearcher = null;
     try {
       currentConfig = loadConfig();
     } catch {
@@ -38,86 +39,22 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (!index) {
-      syncDone = true;
+      await syncController.start({
+        config: currentConfig,
+        index,
+        ctx,
+      });
       return; // KB-only mode — no local index to sync
     }
-
-    // Sync in a child process so it never blocks the main event loop
-    const MAX_WORKER_RESTARTS = 3;
-    const RESTART_WINDOW_MS = 60_000;
-    let workerRestartCount = 0;
-    let workerRestartWindowStart = Date.now();
-
-    function spawnWorker() {
-      // Use pre-compiled worker to avoid ESM/CJS cycle with tsx on Node 25+
-      // Rebuild with: npx esbuild src/sync-worker.ts --bundle --platform=node --format=esm --outfile=dist/sync-worker.mjs --external:better-sqlite3 --packages=external
-      const workerPath = join(import.meta.dirname, "..", "dist", "sync-worker.mjs");
-      const worker = fork(workerPath, [], {
-        stdio: ["ignore", "pipe", "pipe", "ipc"],
-        env: { ...process.env },
-      });
-
-      let stdout = "";
-      worker.stdout?.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString();
-      });
-      worker.stderr?.on("data", (chunk: Buffer) => {
-        console.error(`knowledge-search worker: ${chunk.toString().trim()}`);
-      });
-
-      worker.on("error", (err) => {
-        console.error(`knowledge-search: worker error: ${err.message}`);
-      });
-
-      worker.on("exit", async (code, signal) => {
-        syncDone = true;
-        if (code === 0 && stdout) {
-          try {
-            const result = JSON.parse(stdout);
-            // Reload the index from disk since the worker updated it
-            await index!.load();
-            const changes = result.added + result.updated + result.removed;
-            if (changes > 0) {
-              ctx.ui.setStatus(
-                "knowledge-search",
-                `Index: +${result.added} ~${result.updated} -${result.removed} (${result.size} files, ${result.chunks} chunks)`
-              );
-              setTimeout(() => ctx.ui.setStatus("knowledge-search", ""), 5000);
-            }
-          } catch {
-            // ignore parse errors
-          }
-        } else if (code !== 0 && !workerExitExpected) {
-          const now = Date.now();
-          // Reset counter if outside the time window
-          if (now - workerRestartWindowStart > RESTART_WINDOW_MS) {
-            workerRestartCount = 0;
-            workerRestartWindowStart = now;
-          }
-          workerRestartCount++;
-
-          if (workerRestartCount > MAX_WORKER_RESTARTS) {
-            console.error(
-              `knowledge-search: worker crashed ${workerRestartCount} times within ${RESTART_WINDOW_MS / 1000}s, giving up`
-            );
-          } else {
-            console.error(
-              `knowledge-search: worker exited unexpectedly (code=${code}, signal=${signal}), restarting (${workerRestartCount}/${MAX_WORKER_RESTARTS})...`
-            );
-            setTimeout(() => {
-              if (!workerExitExpected) spawnWorker();
-            }, 2000);
-          }
-        }
-      });
-      worker.unref();
-    }
-
-    spawnWorker();
+    await syncController.start({
+      config: currentConfig,
+      index,
+      ctx,
+    });
   });
 
   pi.on("session_shutdown", async () => {
-    workerExitExpected = true;
+    await syncController.stop();
     // watcher removed (d38a81f) — caused UI freezes. Rely on sync-on-startup only.
     await index?.close();
   });
@@ -193,6 +130,7 @@ export default function (pi: ExtensionAPI) {
             dirs,
             fileExtensions,
             excludeDirs,
+            kbAdapter: "jsonl_v4",
             provider: {
               type: "openai",
               apiKey: apiKey?.startsWith("(") ? undefined : apiKey || undefined,
@@ -209,6 +147,7 @@ export default function (pi: ExtensionAPI) {
             dirs,
             fileExtensions,
             excludeDirs,
+            kbAdapter: "jsonl_v4",
             provider: {
               type: "bedrock",
               profile: profile || "default",
@@ -225,6 +164,7 @@ export default function (pi: ExtensionAPI) {
             dirs,
             fileExtensions,
             excludeDirs,
+            kbAdapter: "jsonl_v4",
             provider: {
               type: "ollama",
               url: url || "http://localhost:11434",
@@ -302,22 +242,92 @@ export default function (pi: ExtensionAPI) {
   // Reindex command
   // ------------------------------------------------------------------
 
-  pi.registerCommand("knowledge-reindex", {
-    description: "Force full re-index of all configured knowledge directories",
+  pi.registerCommand("knowledge-reindex-start", {
+    description: "Start or resume knowledgebase re-indexing without clearing existing index state",
     handler: async (_args, ctx) => {
-      if (!index) {
+      if (!index || !currentConfig) {
         ctx.ui.notify("Not configured. Run /knowledge-search-setup first.", "warning");
         return;
       }
-      ctx.ui.notify("Re-indexing...", "info");
+
+      ctx.ui.notify("Starting or resuming re-index...", "info");
       try {
-        await index.rebuild();
+        index.setReindexState("running");
+        await syncController.start(
+          {
+            config: currentConfig,
+            index,
+            ctx,
+          },
+          { respectPausedState: false }
+        );
+
+        ctx.ui.notify("Re-index started in background. Use /knowledge-reindex-stop to pause.", "info");
+      } catch (err: any) {
+        ctx.ui.notify(`Re-index start failed: ${err.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("knowledge-reindex-stop", {
+    description: "Pause knowledgebase re-indexing and keep checkpoint state for resume",
+    handler: async (_args, ctx) => {
+      try {
+        await syncController.pause(ctx);
+        ctx.ui.notify("Re-index paused. Use /knowledge-reindex-start to resume.", "info");
+      } catch (err: any) {
+        ctx.ui.notify(`Re-index stop failed: ${err.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("knowledge-reindex-restart", {
+    description: "Restart knowledgebase re-indexing from a fresh index state",
+    handler: async (_args, ctx) => {
+      if (!index || !currentConfig) {
+        ctx.ui.notify("Not configured. Run /knowledge-search-setup first.", "warning");
+        return;
+      }
+
+      ctx.ui.notify("Restarting re-index from a clean index state...", "info");
+      try {
+        await syncController.restart({
+          config: currentConfig,
+          index,
+          ctx,
+        });
+
         ctx.ui.notify(
-          `Re-indexed: ${index.size()} files (${index.chunkCount()} chunks)`,
+          "Re-index restarted from a fresh index. Use /knowledge-reindex-stop to pause.",
           "info"
         );
       } catch (err: any) {
-        ctx.ui.notify(`Re-index failed: ${err.message}`, "error");
+        ctx.ui.notify(`Re-index restart failed: ${err.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("knowledge-reindex", {
+    description: "Alias for /knowledge-reindex-restart",
+    handler: async (_args, ctx) => {
+      if (!index || !currentConfig) {
+        ctx.ui.notify("Not configured. Run /knowledge-search-setup first.", "warning");
+        return;
+      }
+
+      ctx.ui.notify("Restarting re-index from a clean index state...", "info");
+      try {
+        await syncController.restart({
+          config: currentConfig,
+          index,
+          ctx,
+        });
+        ctx.ui.notify(
+          "Re-index restarted from a fresh index. Use /knowledge-reindex-stop to pause.",
+          "info"
+        );
+      } catch (err: any) {
+        ctx.ui.notify(`Re-index restart failed: ${err.message}`, "error");
       }
     },
   });
@@ -353,7 +363,7 @@ export default function (pi: ExtensionAPI) {
         const msg =
           !index && !kbSearcher
             ? "knowledge-search is not configured. The user can run /knowledge-search-setup to set it up."
-            : !syncDone && index
+            : !syncController.done() && index
               ? "Index is still syncing in the background. Try again in a moment."
               : "Index is empty.";
         return { content: [{ type: "text", text: msg }], details: {} };

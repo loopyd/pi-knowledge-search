@@ -27,6 +27,9 @@
     "@aws-sdk/credential-providers": "3.750.0"
   },
   "dependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.9.0",
+    "drizzle-orm": "^0.45.2",
     "remark-frontmatter": "^5.0.0",
     "remark-parse": "^11.0.0",
     "stream-json": "^2.1.0",
@@ -34,7 +37,9 @@
     "unified": "^11.0.5"
   },
   "scripts": {
-    "test": "node --test --import tsx src/**/*.test.ts",
+    "test": "node --test --import tsx tests/*.test.ts tests/**/*.test.ts",
+    "test:coverage": "node --test --experimental-test-coverage --import tsx tests/*.test.ts tests/**/*.test.ts",
+    "test:coverage:ci": "node --test --experimental-test-coverage --test-coverage-lines=95 --test-coverage-branches=84 --test-coverage-functions=90 --import tsx tests/*.test.ts tests/**/*.test.ts",
     "build:worker": "esbuild src/sync-worker.ts --bundle --platform=node --format=esm --outfile=dist/sync-worker.mjs --external:better-sqlite3 --packages=external",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",

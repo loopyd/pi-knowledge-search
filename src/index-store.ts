@@ -1,46 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import Assembler from "stream-json/assembler.js";
-import makeParser from "stream-json/index.js";
-import type { Config } from "./config.js";
-import type { Embedder } from "./embedder.js";
-import { chunkMarkdown, type Chunk } from "./chunker.js";
+import { chunkMarkdown } from "./chunker.js";
+import { createIndexAdapter } from "./adapters/index.js";
+import type { Chunk, Config, Embedder, IndexAdapter, IndexData, SearchResult, SyncProgress } from "./types.js";
 
-interface IndexEntry {
-  /** Relative path from its source directory root */
-  relPath: string;
-  /** Which source directory this belongs to */
-  sourceDir: string;
-  /** File mtime (ms) at time of indexing */
-  mtime: number;
-  /** Embedding vector */
-  vector: number[];
-  /** This chunk's content for excerpt display */
-  excerpt: string;
-  /** Section heading this chunk falls under */
-  heading: string;
-  /** Chunk index (0, 1, 2... for multi-chunk files) */
-  chunkIndex: number;
-}
+export type { SearchResult } from "./types.js";
 
-interface IndexData {
-  version: number;
-  dimensions: number;
-  entries: Record<string, IndexEntry>; // keyed by "absPath#chunkIndex"
-}
-
-export interface SearchResult {
-  /** Absolute file path */
-  path: string;
-  /** Cosine similarity score (0-1) */
-  score: number;
-  /** Content excerpt (the matched chunk) */
-  excerpt: string;
-  /** Section heading for context */
-  heading: string;
-}
-
-const INDEX_VERSION = 3; // Bumped from 2 for chunk support
 const MAX_EXCERPT_LENGTH = 3500; // Safety cap for stored excerpts
 
 export class KnowledgeIndex {
@@ -49,15 +14,23 @@ export class KnowledgeIndex {
   private data: IndexData;
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private adapter: IndexAdapter<IndexData, unknown>;
 
   constructor(config: Config, embedder: Embedder) {
     this.config = config;
     this.embedder = embedder;
-    this.data = {
-      version: INDEX_VERSION,
-      dimensions: config.dimensions,
-      entries: {},
-    };
+    this.adapter = createIndexAdapter(config.kbAdapterSourceUri, config.dimensions, config.kbAdapter);
+    this.data = this.adapter.empty();
+  }
+
+  reindexState(): "running" | "paused" {
+    return this.data.reindexState;
+  }
+
+  setReindexState(state: "running" | "paused"): void {
+    if (this.data.reindexState === state) return;
+    this.data.reindexState = state;
+    this.scheduleSave();
   }
 
   size(): number {
@@ -74,174 +47,35 @@ export class KnowledgeIndex {
   }
 
   /**
-   * Threshold above which the load/save paths switch to streaming. V8's
-   * string length limit is ~512MB (2^29 - 24 bytes on 64-bit). A single
-   * call to `readFileSync(path, "utf-8")` or `JSON.stringify(hugeObject)`
-   * throws `RangeError: Invalid string length` once that limit is hit.
-   *
-   * Below this threshold we use the straightforward sync paths since they
-   * are an order of magnitude faster. Above it we switch to streaming.
-   *
-   * Set to 256MB to give a generous safety margin below the hard cliff.
-   */
-  private static readonly STREAMING_THRESHOLD_BYTES = 256 * 1024 * 1024;
-
-  /**
    * Load the index from disk.
-   *
-   * Uses a fast sync path (`readFileSync` + `JSON.parse`) for normal-sized
-   * indexes and automatically falls back to a streaming reader for files
-   * large enough to risk V8's string length limit (`RangeError: Invalid
-   * string length`).
-   *
-   * If the file is missing, corrupt, or from an incompatible version, falls
-   * back to an empty index and returns — callers will then trigger a full
-   * re-index. Never throws.
    */
   async load(): Promise<void> {
-    const indexFile = path.join(this.config.indexDir, "index.json");
-    if (!fs.existsSync(indexFile)) return;
-
-    try {
-      let parsed: IndexData | null = null;
-      const size = fs.statSync(indexFile).size;
-      if (size >= KnowledgeIndex.STREAMING_THRESHOLD_BYTES) {
-        parsed = await this.streamLoadJson(indexFile);
-      } else {
-        const raw = fs.readFileSync(indexFile, "utf-8");
-        parsed = JSON.parse(raw) as IndexData;
-      }
-      if (
-        parsed &&
-        parsed.version === INDEX_VERSION &&
-        parsed.dimensions === this.config.dimensions
-      ) {
-        this.data = parsed;
-      }
-      // Version or dimension mismatch → keep fresh data, caller will re-index.
-    } catch {
-      // Corrupt file / partial write / IO error → fresh index.
+    const loaded = await this.adapter.read();
+    if (loaded) {
+      this.data = loaded;
     }
   }
 
-  private streamLoadJson(file: string): Promise<IndexData | null> {
-    return new Promise((resolve, reject) => {
-      const stream = fs.createReadStream(file, { highWaterMark: 256 * 1024 });
-      const parser = makeParser();
-      const assembler = Assembler.connectTo(parser);
 
-      let settled = false;
-      const settle = (ok: () => void, err?: (e: Error) => void) => {
-        if (settled) return;
-        settled = true;
-        if (err) err(new Error("assembler failed"));
-        else ok();
-      };
-
-      assembler.on("done", (asm) => {
-        settle(() => resolve(asm.current as IndexData));
-      });
-      stream.on("error", (e) => settle(() => resolve(null), () => reject(e)));
-      parser.on("error", (e) => settle(() => resolve(null), () => reject(e)));
-
-      stream.pipe(parser);
-    });
-  }
-
-
-  /**
-   * Persist the index to disk.
-   *
-   * Fast path: `JSON.stringify` + `writeFile`, wrapped in an atomic rename
-   * from `index.json.tmp`. This handles all normal-sized indexes in one shot.
-   *
-   * Fallback path: if `JSON.stringify` throws `RangeError: Invalid string
-   * length` (V8's ~512MB string limit), fall back to streaming the JSON out
-   * block by block via `createWriteStream`. This path never materialises the
-   * full serialised form as a single string.
-   *
-   * Either way the write is atomic: content goes to `index.json.tmp` first,
-   * then renamed over `index.json` once fully flushed. A crash mid-write
-   * leaves the previous `index.json` intact.
-   */
   private async save(): Promise<void> {
-    fs.mkdirSync(this.config.indexDir, { recursive: true });
-    const finalFile = path.join(this.config.indexDir, "index.json");
-    const tmpFile = finalFile + ".tmp";
-
     try {
-      let serialised: string;
-      try {
-        serialised = JSON.stringify(this.data);
-      } catch (err) {
-        if (err instanceof RangeError) {
-          await this.saveStreaming(tmpFile);
-          await fs.promises.rename(tmpFile, finalFile);
-          this.dirty = false;
-          return;
-        }
-        throw err;
-      }
-      await fs.promises.writeFile(tmpFile, serialised);
-      await fs.promises.rename(tmpFile, finalFile);
+      await this.adapter.write(this.data);
       this.dirty = false;
-    } catch (err) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {
-        // best-effort cleanup
-      }
-      throw err;
+    } catch {
+      // Best-effort persistence only; keep dirty state for a later retry.
     }
   }
 
-  /**
-   * Streaming fallback used when the index is too big for `JSON.stringify`
-   * to produce a single string. Writes key-by-key through a write stream so
-   * no intermediate giant string is ever materialised.
-   */
-  private async saveStreaming(tmpFile: string): Promise<void> {
-    const stream = fs.createWriteStream(tmpFile);
-    let streamError: Error | null = null;
-    stream.once("error", (err) => {
-      streamError = err;
-    });
-
-    const write = (chunk: string): Promise<void> =>
-      new Promise((resolve, reject) => {
-        if (streamError) {
-          reject(streamError);
-          return;
-        }
-        if (stream.write(chunk)) {
-          resolve();
-        } else {
-          stream.once("drain", () => (streamError ? reject(streamError) : resolve()));
-        }
-      });
-
+  private emitProgress(
+    onProgress: ((progress: SyncProgress) => void) | undefined,
+    progress: SyncProgress
+  ): void {
+    if (!onProgress) return;
     try {
-      await write(
-        `{"version":${JSON.stringify(this.data.version)},` +
-          `"dimensions":${JSON.stringify(this.data.dimensions)},` +
-          `"entries":{`
-      );
-      let first = true;
-      for (const key of Object.keys(this.data.entries)) {
-        const entry = this.data.entries[key];
-        const prefix = first ? "" : ",";
-        first = false;
-        await write(`${prefix}${JSON.stringify(key)}:${JSON.stringify(entry)}`);
-      }
-      await write("}}");
-    } catch (err) {
-      stream.destroy();
-      throw err;
+      onProgress(progress);
+    } catch {
+      // Ignore progress callback failures.
     }
-
-    await new Promise<void>((resolve, reject) => {
-      stream.end((err?: Error | null) => (err ? reject(err) : resolve()));
-    });
   }
 
   scheduleSave(): void {
@@ -301,7 +135,9 @@ export class KnowledgeIndex {
   /**
    * Scan all configured directories, find new/changed/removed files, update index.
    */
-  async sync(): Promise<{ added: number; updated: number; removed: number }> {
+  async sync(
+    onProgress?: (progress: SyncProgress) => void
+  ): Promise<{ added: number; updated: number; removed: number }> {
     const allFiles = this.scanAllFiles();
     const currentPaths = new Set(allFiles.map((f) => f.absPath));
 
@@ -316,6 +152,15 @@ export class KnowledgeIndex {
         this.removeAllChunks(absPath);
       }
     }
+
+    this.emitProgress(onProgress, {
+      phase: "scan",
+      processed: allFiles.length,
+      total: allFiles.length,
+      added: 0,
+      updated: 0,
+      removed,
+    });
 
     // Find new or updated files
     const toProcess: {
@@ -341,6 +186,15 @@ export class KnowledgeIndex {
 
       toProcess.push({ ...file, content, chunks });
     }
+
+    this.emitProgress(onProgress, {
+      phase: "queue",
+      processed: toProcess.length,
+      total: toProcess.length,
+      added: 0,
+      updated: 0,
+      removed,
+    });
 
     let added = 0;
     let updated = 0;
@@ -369,6 +223,14 @@ export class KnowledgeIndex {
         for (let j = 0; j < vectors.length; j++) {
           allVectors[i + j] = vectors[j];
         }
+        this.emitProgress(onProgress, {
+          phase: "embed",
+          processed: Math.min(i + vectors.length, allChunkTexts.length),
+          total: allChunkTexts.length,
+          added,
+          updated,
+          removed,
+        });
       }
 
       // Store results, grouped by file
@@ -400,6 +262,15 @@ export class KnowledgeIndex {
           heading: chunk.heading,
           chunkIndex: chunkIdx,
         };
+
+        this.emitProgress(onProgress, {
+          phase: "upsert",
+          processed: i + 1,
+          total: chunkMeta.length,
+          added,
+          updated,
+          removed,
+        });
       }
     }
 
@@ -408,6 +279,21 @@ export class KnowledgeIndex {
     }
 
     return { added, updated, removed };
+  }
+
+  async reset(onProgress?: (progress: SyncProgress) => void): Promise<void> {
+    this.emitProgress(onProgress, {
+      phase: "init",
+      processed: 0,
+      total: 0,
+      added: 0,
+      updated: 0,
+      removed: 0,
+      detail: "resetting index state",
+    });
+    this.data.entries = {};
+    this.scheduleSave();
+    await this.close();
   }
 
   async rebuild(): Promise<void> {
@@ -522,6 +408,7 @@ export class KnowledgeIndex {
     if (this.dirty) {
       await this.save();
     }
+    await this.adapter.close?.();
   }
 
   // -----------------------------------------------------------------------

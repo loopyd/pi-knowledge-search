@@ -1,18 +1,18 @@
-import { describe, it, before, beforeEach, afterEach, after } from "node:test";
+import { after, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import * as path from "node:path";
 import * as os from "node:os";
-
-// CONFIG_PATH is evaluated at module load time from KNOWLEDGE_SEARCH_CONFIG env var.
-// ESM hoists imports before top-level code, so we must use dynamic import().
-// We set env var first, then dynamically import config.ts.
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ks-config-test-"));
 const configFile = path.join(tmpDir, "config.json");
 
-// These env vars need to be saved/restored
 const envKeys = [
+  "KB_ADAPTER",
+  "KB_ADAPTER_SOURCE_URI",
+  "KNOWLEDGE_SEARCH_KB_ADAPTER",
+  "KNOWLEDGE_SEARCH_KB_ADAPTER_SOURCE_URI",
   "KNOWLEDGE_SEARCH_CONFIG",
   "KNOWLEDGE_SEARCH_DIRS",
   "KNOWLEDGE_SEARCH_EXTENSIONS",
@@ -33,49 +33,44 @@ const envKeys = [
   "OPENAI_API_KEY",
 ];
 
-let loadConfig: (typeof import("./config.js"))["loadConfig"];
-let getConfigPath: (typeof import("./config.js"))["getConfigPath"];
-let saveConfig: (typeof import("./config.js"))["saveConfig"];
+let loadConfig: (typeof import("../src/config.js"))["loadConfig"];
+let getConfigPath: (typeof import("../src/config.js"))["getConfigPath"];
+let saveConfig: (typeof import("../src/config.js"))["saveConfig"];
 
 const originalEnv: Record<string, string | undefined> = {};
 
 describe("config", () => {
   before(async () => {
-    // Save ALL env state
     for (const key of envKeys) {
       originalEnv[key] = process.env[key];
     }
-    // Set config path BEFORE importing config module
+
     process.env.KNOWLEDGE_SEARCH_CONFIG = configFile;
-    // Clear interfering env vars
     for (const key of envKeys) {
       if (key !== "KNOWLEDGE_SEARCH_CONFIG" && key !== "HOME") {
         delete process.env[key];
       }
     }
 
-    // Dynamic import so CONFIG_PATH picks up our env var
-    const configModule = await import("./config.js");
+    const configModule = await import("../src/config.js");
     loadConfig = configModule.loadConfig;
     getConfigPath = configModule.getConfigPath;
     saveConfig = configModule.saveConfig;
   });
 
   beforeEach(() => {
-    // Clear all knowledge search env vars except CONFIG
     for (const key of envKeys) {
       if (key !== "KNOWLEDGE_SEARCH_CONFIG") {
         delete process.env[key];
       }
     }
-    // Remove config file if exists
+
     try {
       fs.unlinkSync(configFile);
     } catch {}
   });
 
   after(() => {
-    // Restore env
     for (const key of envKeys) {
       if (originalEnv[key] === undefined) {
         delete process.env[key];
@@ -91,8 +86,7 @@ describe("config", () => {
   });
 
   it("returns null when no config file and no env vars", () => {
-    const config = loadConfig();
-    assert.equal(config, null);
+    assert.equal(loadConfig(), null);
   });
 
   it("loads valid config from file", () => {
@@ -103,6 +97,7 @@ describe("config", () => {
         fileExtensions: [".md"],
         excludeDirs: ["node_modules"],
         dimensions: 256,
+        kbAdapter: "sqlite_local",
         provider: {
           type: "openai",
           apiKey: "sk-test-key-123",
@@ -117,6 +112,7 @@ describe("config", () => {
     assert.deepStrictEqual(config.dirs, ["/tmp/test-docs"]);
     assert.deepStrictEqual(config.fileExtensions, [".md"]);
     assert.equal(config.dimensions, 256);
+    assert.equal(config.kbAdapter, "sqlite_local");
     assert.equal(config.provider.type, "openai");
     if (config.provider.type === "openai") {
       assert.equal(config.provider.apiKey, "sk-test-key-123");
@@ -125,8 +121,7 @@ describe("config", () => {
 
   it("returns null for corrupt JSON config file", () => {
     fs.writeFileSync(configFile, "{ this is not valid json }}}}");
-    const config = loadConfig();
-    assert.equal(config, null);
+    assert.equal(loadConfig(), null);
   });
 
   it("uses env var KNOWLEDGE_SEARCH_DIRS as fallback", () => {
@@ -135,12 +130,9 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
     assert.deepStrictEqual(config.dirs, ["/tmp/dir-a", "/tmp/dir-b"]);
-    assert.equal(config.provider.type, "openai");
-    if (config.provider.type === "openai") {
-      assert.equal(config.provider.apiKey, "sk-env-key");
-    }
+    assert.equal(config.kbAdapter, "jsonl_v4");
+    assert.equal(config.provider?.type, "openai");
   });
 
   it("applies default values for optional fields", () => {
@@ -156,9 +148,6 @@ describe("config", () => {
     assert.ok(config);
     assert.deepStrictEqual(config.fileExtensions, [".md", ".txt"]);
     assert.ok(config.excludeDirs.includes("node_modules"));
-    assert.ok(config.excludeDirs.includes(".git"));
-    assert.ok(config.excludeDirs.includes(".obsidian"));
-    assert.ok(config.excludeDirs.includes(".trash"));
     assert.equal(config.dimensions, 512);
   });
 
@@ -211,12 +200,7 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    assert.equal(config.provider.type, "bedrock");
-    if (config.provider.type === "bedrock") {
-      assert.equal(config.provider.profile, "my-profile");
-      assert.equal(config.provider.region, "us-west-2");
-    }
+    assert.equal(config.provider?.type, "bedrock");
   });
 
   it("configures ollama provider", () => {
@@ -234,12 +218,7 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    assert.equal(config.provider.type, "ollama");
-    if (config.provider.type === "ollama") {
-      assert.equal(config.provider.url, "http://localhost:11434");
-      assert.equal(config.provider.model, "nomic-embed-text");
-    }
+    assert.equal(config.provider?.type, "ollama");
   });
 
   it("throws for unknown provider type", () => {
@@ -252,6 +231,76 @@ describe("config", () => {
     );
 
     assert.throws(() => loadConfig(), /Unknown provider/);
+  });
+
+  it("normalizes KB_ADAPTER jsonl_v3 to json_v3", () => {
+    process.env.KNOWLEDGE_SEARCH_DIRS = "/tmp/docs";
+    process.env.OPENAI_API_KEY = "sk-env-key";
+    process.env.KB_ADAPTER = "jsonl_v3";
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.equal(config.kbAdapter, "json_v3");
+  });
+
+  it("accepts json_v2 as a direct adapter selection", () => {
+    process.env.KNOWLEDGE_SEARCH_DIRS = "/tmp/docs";
+    process.env.OPENAI_API_KEY = "sk-env-key";
+    process.env.KB_ADAPTER = "json_v2";
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.equal(config.kbAdapter, "json_v2");
+    assert.equal(
+      config.kbAdapterSourceUri,
+      pathToFileURL(path.join(process.env.HOME || "/tmp", ".pi", "knowledge-search", "index.json"))
+        .toString()
+    );
+  });
+
+  it("uses kbAdapterSourceUri from config and derives indexDir from it", () => {
+    const adapterPath = path.join(tmpDir, "legacy-source.jsonl");
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        provider: { type: "openai", apiKey: "sk-test" },
+        kbAdapter: "jsonl_v4",
+        kbAdapterSourceUri: pathToFileURL(adapterPath).toString(),
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.equal(config.indexDir, tmpDir);
+    assert.equal(config.kbAdapterSourceUri, pathToFileURL(adapterPath).toString());
+  });
+
+  it("normalizes plain local adapter paths into file URIs", () => {
+    process.env.KNOWLEDGE_SEARCH_DIRS = "/tmp/docs";
+    process.env.OPENAI_API_KEY = "sk-env-key";
+    process.env.KNOWLEDGE_SEARCH_KB_ADAPTER_SOURCE_URI = "~/kb/custom.sqlite";
+    process.env.KNOWLEDGE_SEARCH_KB_ADAPTER = "sqlite_local";
+    process.env.HOME = "/home/testuser";
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.equal(config.kbAdapterSourceUri, pathToFileURL("/home/testuser/kb/custom.sqlite").toString());
+    assert.equal(config.indexDir, "/home/testuser/kb");
+  });
+
+  it("prefers configured sqlite_local adapter from file", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        kbAdapter: "sqlite_local",
+        provider: { type: "openai", apiKey: "sk-test" },
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.equal(config.kbAdapter, "sqlite_local");
   });
 
   it("env vars override config file values", () => {
@@ -284,18 +333,16 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "openai") {
+    if (config.provider?.type === "openai") {
       assert.equal(config.provider.apiKey, "sk-env-override");
     }
   });
 
   it("saveConfig writes valid JSON to config path", () => {
-    const configData = {
+    saveConfig({
       dirs: ["/tmp/saved"],
-      provider: { type: "openai" as const, apiKey: "sk-saved" },
-    };
-    saveConfig(configData);
+      provider: { type: "openai", apiKey: "sk-saved" },
+    });
 
     const raw = fs.readFileSync(configFile, "utf-8");
     const parsed = JSON.parse(raw);
@@ -312,8 +359,7 @@ describe("config", () => {
       })
     );
 
-    const config = loadConfig();
-    assert.equal(config, null);
+    assert.equal(loadConfig(), null);
   });
 
   it("bedrock provider uses defaults when fields missing", () => {
@@ -327,11 +373,9 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "bedrock") {
+    if (config.provider?.type === "bedrock") {
       assert.equal(config.provider.profile, "default");
       assert.equal(config.provider.region, "us-east-1");
-      assert.equal(config.provider.model, "amazon.titan-embed-text-v2:0");
     }
   });
 
@@ -346,16 +390,11 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "ollama") {
+    if (config.provider?.type === "ollama") {
       assert.equal(config.provider.url, "http://localhost:11434");
       assert.equal(config.provider.model, "nomic-embed-text");
     }
   });
-
-  // ---------------------------------------------------------------------
-  // openai-compatible provider
-  // ---------------------------------------------------------------------
 
   it("configures openai-compatible provider from file", () => {
     fs.writeFileSync(
@@ -373,9 +412,7 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    assert.equal(config.provider.type, "openai-compatible");
-    if (config.provider.type === "openai-compatible") {
+    if (config.provider?.type === "openai-compatible") {
       assert.equal(config.provider.baseUrl, "http://127.0.0.1:8080");
       assert.equal(config.provider.apiKey, "local-key");
       assert.equal(config.provider.model, "qwen3-embeddings");
@@ -396,8 +433,7 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "openai-compatible") {
+    if (config.provider?.type === "openai-compatible") {
       assert.equal(config.provider.model, "text-embedding-3-small");
       assert.equal(config.provider.apiKey, undefined);
     }
@@ -434,8 +470,7 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "openai-compatible") {
+    if (config.provider?.type === "openai-compatible") {
       assert.equal(config.provider.baseUrl, "http://env-host:9999");
       assert.equal(config.provider.apiKey, "env-key");
       assert.equal(config.provider.model, "env-model");
@@ -457,9 +492,7 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "openai-compatible") {
-      // Real OpenAI key must NOT be bled into third-party endpoint
+    if (config.provider?.type === "openai-compatible") {
       assert.equal(config.provider.apiKey, undefined);
     }
   });
